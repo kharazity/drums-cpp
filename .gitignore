@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+drums_cpp
+
+# IDE / Editor
+.cache/
+.vscode/
+.idea/
+compile_commands.json
+imgui.ini
+
+# OS
+.DS_Store
