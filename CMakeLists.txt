@@ -30,13 +30,26 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Spectra)
 
-# 3. SDL2 (Window/Audio)
-FetchContent_Declare(
-  SDL2
-  GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-  GIT_TAG        release-2.30.0
-)
-FetchContent_MakeAvailable(SDL2)
+# 3. SDL2 (Window/Audio) — prefer system install, fallback to source
+find_package(SDL2 QUIET)
+if(NOT SDL2_FOUND)
+  message(STATUS "SDL2 not found on system, fetching from source...")
+  # Hint SDL2 to enable common audio backends when building from source
+  set(SDL_ALSA       ON  CACHE BOOL "" FORCE)
+  set(SDL_PULSEAUDIO ON  CACHE BOOL "" FORCE)
+  set(SDL_PIPEWIRE   ON  CACHE BOOL "" FORCE)
+  set(SDL_ALSA_SHARED      OFF CACHE BOOL "" FORCE)
+  set(SDL_PULSEAUDIO_SHARED OFF CACHE BOOL "" FORCE)
+  set(SDL_PIPEWIRE_SHARED  OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    SDL2
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG        release-2.30.0
+  )
+  FetchContent_MakeAvailable(SDL2)
+else()
+  message(STATUS "Using system SDL2: ${SDL2_VERSION}")
+endif()
 
 # 4. Dear ImGui
 FetchContent_Declare(

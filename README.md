@@ -1,4 +1,4 @@
-# Drums C++ 🥁
+# Drums C++ 
 
 Real-time interactive drum membrane simulator with GUI, built with SDL2, ImGui, and Eigen.
 
@@ -50,12 +50,35 @@ The strike forcing f(t) is a smooth temporal bump function **exp(-1/(1-ξ²))** 
 
 ## System Dependencies
 
+CMake will prefer your system-installed SDL2 if available, and only build it from source as a fallback. Installing SDL2 via your package manager is strongly recommended, as your distro's build will already include support for whichever audio backend you're running.
+
+### Ubuntu 22.04+ / Debian 12+ (PipeWire)
+
+PipeWire is the default audio system on modern Ubuntu and Debian. The `libsdl2-dev` package is compiled with PipeWire support out of the box.
+
 ```bash
-# Ubuntu/Debian
-sudo apt-get install -y cmake g++ libeigen3-dev libgl-dev
+sudo apt-get install -y cmake g++ libeigen3-dev libgl-dev libsdl2-dev
 ```
 
-All other dependencies (SDL2, ImGui, ImPlot, Spectra, CDT) are fetched automatically by CMake.
+### Ubuntu 20.04 / Debian 11 (PulseAudio)
+
+Older releases use PulseAudio. Install the PulseAudio dev library alongside SDL2 so audio initialises correctly.
+
+```bash
+sudo apt-get install -y cmake g++ libeigen3-dev libgl-dev libsdl2-dev libpulse-dev
+```
+
+### Minimal / Server installs (ALSA only)
+
+If you're on a headless or stripped-down system without PulseAudio or PipeWire, SDL2 will fall back to ALSA directly.
+
+```bash
+sudo apt-get install -y cmake g++ libeigen3-dev libgl-dev libsdl2-dev libasound2-dev
+```
+
+> **Note:** If you see `Failed to init audio: dsp: no such audio device (Running in silent mode)` at runtime, it means SDL2 was built or installed without support for your audio backend. The fix is to install the appropriate dev package above (matching your running audio system) and do a clean rebuild: `rm -rf build/`.
+
+All other dependencies (ImGui, ImPlot, Spectra, CDT) are fetched automatically by CMake.
 
 ## Build & Run
 
