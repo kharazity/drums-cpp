@@ -36,6 +36,9 @@ int main(int argc, char* argv[]) {
     fems.push_back(FEM());
     fems[0].assemble(meshes[0]);
     all_modes.push_back(Solver::solve(fems[0], 60));
+    audio.precompute_MU(fems[0], all_modes[0]);
+    audio.compute_xi(meshes[0]);
+    audio.compute_radiation_weights(all_modes[0]);
     
     // Visualization State
     float zoom = 300.0f;
@@ -60,6 +63,7 @@ int main(int argc, char* argv[]) {
     std::vector<float> amps;
     int last_struck_mesh = 0;
     int dragged_mesh_idx = -1;
+    char export_wav_path[256] = "output/strike.wav";
     
     // ────────────────────────────────────────────────────────────────────────
 
@@ -209,10 +213,18 @@ int main(int argc, char* argv[]) {
                             }
                         }
                         
+                        // Precompute radiation weights for first mesh
+                        if (!fems.empty() && !all_modes.empty()) {
+                            audio.precompute_MU(fems[0], all_modes[0]);
+                            audio.compute_xi(meshes[0]);
+                            audio.compute_radiation_weights(all_modes[0]);
+                        }
+                        
                         freqs.clear();
                         {
                             std::lock_guard<std::mutex> lock(audio.mutex);
-                            audio.active_modes.resize(0);
+                            audio.modes_state.count = 0;
+                            memset(audio.modes_state.active, 0, sizeof(audio.modes_state.active));
                         }
                     }
                 } else {
@@ -236,10 +248,15 @@ int main(int argc, char* argv[]) {
                                 fems.push_back(f);
                                 all_modes.push_back(Solver::solve(f, n_modes));
 
+                                audio.precompute_MU(fems[0], all_modes[0]);
+                                audio.compute_xi(meshes[0]);
+                                audio.compute_radiation_weights(all_modes[0]);
+
                                 freqs.clear();
                                 {
                                     std::lock_guard<std::mutex> lock(audio.mutex);
-                                    audio.active_modes.resize(0);
+                                    audio.modes_state.count = 0;
+                                    memset(audio.modes_state.active, 0, sizeof(audio.modes_state.active));
                                 }
                             }
                             app_mode = PLAY;
@@ -258,9 +275,13 @@ int main(int argc, char* argv[]) {
                 
                 if (app_mode == PLAY) {
                     if (ImGui::Button("Strike Center")) {
-                        if (!meshes.empty() && !meshes[0].vertices.empty()) {
-                            int center_node = meshes[0].vertices.size() / 2; // Default to mesh 0
-                            audio.trigger_strike(meshes[0], all_modes[0], meshes[0].vertices[center_node].x, meshes[0].vertices[center_node].y, center_node, 1.0);
+                        if (!meshes.empty() && !meshes[0].vertices.empty() && !all_modes.empty()) {
+                            // Strike at mesh centroid
+                            double cx = 0, cy = 0;
+                            for (const auto& v : meshes[0].vertices) { cx += v.x; cy += v.y; }
+                            cx /= meshes[0].vertices.size();
+                            cy /= meshes[0].vertices.size();
+                            audio.trigger_strike(meshes[0], all_modes[0], cx, cy, 1.0);
                         }
                     }
                 }
@@ -269,17 +290,23 @@ int main(int argc, char* argv[]) {
                 static float alpha0_f = (float)audio.alpha0;
                 if (ImGui::SliderFloat("Damping (a0)", &alpha0_f, 0.1f, 50.0f, "%.1f")) {
                     audio.alpha0 = (double)alpha0_f;
+                    if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
                 }
                 static float alpha1_f = (float)audio.alpha1;
                 if (ImGui::SliderFloat("Freq Damping (a1)", &alpha1_f, 0.0f, 0.01f, "%.5f")) {
                     audio.alpha1 = (double)alpha1_f;
+                    if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
                 }
                 static float tension_f = (float)audio.tension;
                 if (ImGui::InputFloat("Tension", &tension_f, 1.0f, 10.0f, "%.1f")) {
                     if (tension_f <= 0.0f) {
-                        tension_f = 0.1f; // Ensure tension is strictly positive
+                        tension_f = 0.1f;
                     }
                     audio.tension = (double)tension_f;
+                    // Debounced radiation weight recompute on tension change
+                    if (!all_modes.empty()) {
+                        audio.compute_radiation_weights(all_modes[0]);
+                    }
                 }
                 
                 static float v0_f = (float)audio.strike_v0;
@@ -292,7 +319,27 @@ int main(int argc, char* argv[]) {
                     audio.strike_width_delta = (double)delta_f;
                 }
                 
+                static float vol_f = (float)audio.master_volume;
+                if (ImGui::SliderFloat("Master Volume", &vol_f, 0.01f, 100.0f, "%.2f", ImGuiSliderFlags_Logarithmic)) {
+                    audio.master_volume = (double)vol_f;
+                }
+                
                 ImGui::SliderFloat("Zoom", &zoom, 50.0f, 1000.0f);
+
+                ImGui::Separator();
+                ImGui::Text("Listener Direction");
+                static float elevation_f = (float)audio.listener_elevation;
+                if (ImGui::SliderFloat("Elevation (deg)", &elevation_f, 0.0f, 90.0f, "%.1f")) {
+                    audio.listener_elevation = (double)elevation_f;
+                    if (!meshes.empty()) audio.compute_xi(meshes[0]);
+                    if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
+                }
+                static float azimuth_f = (float)audio.listener_azimuth;
+                if (ImGui::SliderFloat("Azimuth (deg)", &azimuth_f, 0.0f, 360.0f, "%.1f")) {
+                    audio.listener_azimuth = (double)azimuth_f;
+                    if (!meshes.empty()) audio.compute_xi(meshes[0]);
+                    if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
+                }
 
                 ImGui::Separator();
                 ImGui::Text("c = %.1f m/s", audio.wave_speed());
@@ -300,6 +347,20 @@ int main(int argc, char* argv[]) {
                 int total_verts = 0;
                 for (const auto& m : meshes) total_verts += m.vertices.size();
                 ImGui::Text("Meshes: %lu  Total Vertices: %d", meshes.size(), total_verts);
+
+                ImGui::Separator();
+                ImGui::Text("Audio Export");
+                ImGui::InputText("WAV Path", export_wav_path, IM_ARRAYSIZE(export_wav_path));
+                if (ImGui::Button("Export to .wav")) {
+                    std::lock_guard<std::mutex> lock(audio.mutex);
+                    if (audio.last_strike_audio.empty()) {
+                         std::cerr << "Warning: No audio to export. Strike the drum first." << std::endl;
+                    } else if (write_wav_file(export_wav_path, audio.last_strike_audio, SAMPLE_RATE)) {
+                         std::cout << "Successfully exported " << audio.last_strike_audio.size() << " samples to " << export_wav_path << std::endl;
+                    } else {
+                         std::cerr << "Error: Failed to write WAV file to " << export_wav_path << std::endl;
+                    }
+                }
 
                 ImGui::End();
             }
@@ -418,44 +479,9 @@ int main(int argc, char* argv[]) {
                         
                         if (hit_mesh_idx != -1) {
                             dragged_mesh_idx = hit_mesh_idx; // Begin dragging
-                            
-                            // Find a reasonable pickup location: ~30% offset from mesh centroid
-                            int pickup_node = 0;
-                            const auto& target_mesh = meshes[hit_mesh_idx];
-                            if (!target_mesh.vertices.empty()) {
-                                // Compute mesh centroid in world space
-                                double cx = 0.0, cy = 0.0;
-                                for (const auto& v : target_mesh.vertices) {
-                                    cx += v.x;
-                                    cy += v.y;
-                                }
-                                cx /= target_mesh.vertices.size();
-                                cy /= target_mesh.vertices.size();
-                                
-                                // Compute mesh extent to scale the offset
-                                double max_r = 0.0;
-                                for (const auto& v : target_mesh.vertices) {
-                                    double r = std::sqrt((v.x - cx)*(v.x - cx) + (v.y - cy)*(v.y - cy));
-                                    if (r > max_r) max_r = r;
-                                }
-                                
-                                // Target pickup at ~30% of radius from centroid along X
-                                double pickup_wx = cx + 0.3 * max_r;
-                                double pickup_wy = cy;
-                                
-                                double min_pickup_dist = 1e9;
-                                for(size_t i = 0; i < target_mesh.vertices.size(); ++i) {
-                                    double dx = target_mesh.vertices[i].x - pickup_wx;
-                                    double dy = target_mesh.vertices[i].y - pickup_wy;
-                                    double pd = dx*dx + dy*dy;
-                                    if (pd < min_pickup_dist) {
-                                        min_pickup_dist = pd;
-                                        pickup_node = (int)i;
-                                    }
-                                }
-                            }
                             last_struck_mesh = hit_mesh_idx;
-                            audio.trigger_strike(target_mesh, all_modes[hit_mesh_idx], wx, wy, pickup_node, 1.0);
+                            // Far-field radiation: no pickup node needed
+                            audio.trigger_strike(meshes[hit_mesh_idx], all_modes[hit_mesh_idx], wx, wy, 1.0);
                         }
                     }
                     
@@ -528,12 +554,11 @@ int main(int argc, char* argv[]) {
                     // Get current amplitudes from Audio Engine (in dB)
                     {
                         std::lock_guard<std::mutex> lock(audio.mutex);
-                        if (audio.active_modes.count == active_modes_data.eigenvalues.size()) {
+                        if (audio.modes_state.count == (int)active_modes_data.eigenvalues.size()) {
                             for(size_t i = 0; i < active_modes_data.eigenvalues.size(); ++i) {
-                                float zr = audio.active_modes.Z_re[i];
-                                float zi = audio.active_modes.Z_im[i];
+                                float zr = audio.modes_state.Z_re[i];
+                                float zi = audio.modes_state.Z_im[i];
                                 float mag = std::sqrt(zr*zr + zi*zi);
-                                // Convert to dB with a floor of -120 dB
                                 amps[i] = (mag > 1e-20f) ? 20.0f * std::log10(mag) : -120.0f;
                             }
                         }
