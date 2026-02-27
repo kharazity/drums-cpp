@@ -77,93 +77,133 @@ public:
         return inside;
     }
 
-    // ─── Generate mesh from arbitrary closed polygon ────────────────────────
-    void generate_from_polygon(const std::vector<Vertex>& boundary_poly, int density = 15) {
+    // ─── Generate mesh from arbitrary closed polygon (with optional holes) ──
+    void generate_from_polygon(const std::vector<Vertex>& boundary_poly,
+                               const std::vector<std::vector<Vertex>>& holes = {},
+                               int density = 15) {
         clear();
         if (boundary_poly.size() < 3) return;
 
-        int n_boundary = boundary_poly.size();
+        int n_outer = (int)boundary_poly.size();
 
-        // 1. Compute bounding box
+        // 1. Compute bounding box from outer boundary
         double min_x = 1e9, max_x = -1e9, min_y = 1e9, max_y = -1e9;
         for (const auto& v : boundary_poly) {
-            min_x = std::min(min_x, v.x);
-            max_x = std::max(max_x, v.x);
-            min_y = std::min(min_y, v.y);
-            max_y = std::max(max_y, v.y);
+            min_x = std::min(min_x, v.x); max_x = std::max(max_x, v.x);
+            min_y = std::min(min_y, v.y); max_y = std::max(max_y, v.y);
         }
-
         double width = max_x - min_x;
         double height = max_y - min_y;
         double scale = std::max(width, height);
         double step = scale / density;
+        double margin = step * 0.3;
 
-        // 2. Add boundary vertices
-        for (int i = 0; i < n_boundary; ++i) {
+        // 2. Build all boundary edges for margin check
+        //    (outer boundary edges + all hole edges)
+        struct EdgeSeg { Vertex a, b; };
+        std::vector<EdgeSeg> all_boundary_edges;
+        // Outer edges
+        for (int i = 0; i < n_outer; ++i) {
+            int j = (i + 1) % n_outer;
+            all_boundary_edges.push_back({boundary_poly[i], boundary_poly[j]});
+        }
+        // Hole edges
+        for (const auto& hole : holes) {
+            int nh = (int)hole.size();
+            for (int i = 0; i < nh; ++i) {
+                int j = (i + 1) % nh;
+                all_boundary_edges.push_back({hole[i], hole[j]});
+            }
+        }
+
+        // 3. Add outer boundary vertices
+        for (int i = 0; i < n_outer; ++i) {
             vertices.push_back(boundary_poly[i]);
             boundary_nodes.push_back(i);
         }
 
-        // 3. Add interior grid points that pass point-in-polygon test
-        // Add margin to avoid points too close to boundary
-        double margin = step * 0.3;
+        // 4. Add hole boundary vertices (tracking per-hole offsets)
+        std::vector<int> hole_offsets;  // start index for each hole
+        for (const auto& hole : holes) {
+            int offset = (int)vertices.size();
+            hole_offsets.push_back(offset);
+            int nh = (int)hole.size();
+            for (int i = 0; i < nh; ++i) {
+                vertices.push_back(hole[i]);
+                boundary_nodes.push_back(offset + i);
+            }
+        }
+
+        // 5. Add interior grid points: inside outer, outside all holes,
+        //    and not too close to any boundary edge
         for (double y = min_y + step * 0.5; y < max_y; y += step) {
             for (double x = min_x + step * 0.5; x < max_x; x += step) {
-                if (point_in_polygon(x, y, boundary_poly)) {
-                    // Check distance to all boundary edges to avoid degenerate triangles
-                    bool too_close = false;
-                    for (int i = 0; i < n_boundary; ++i) {
-                        int j = (i + 1) % n_boundary;
-                        double ex = boundary_poly[j].x - boundary_poly[i].x;
-                        double ey = boundary_poly[j].y - boundary_poly[i].y;
-                        double len = std::sqrt(ex*ex + ey*ey);
-                        if (len < 1e-10) continue;
-                        // Distance from point to line segment
-                        double t = ((x - boundary_poly[i].x)*ex + (y - boundary_poly[i].y)*ey) / (len*len);
-                        t = std::max(0.0, std::min(1.0, t));
-                        double cx = boundary_poly[i].x + t * ex;
-                        double cy = boundary_poly[i].y + t * ey;
-                        double dist = std::sqrt((x-cx)*(x-cx) + (y-cy)*(y-cy));
-                        if (dist < margin) {
-                            too_close = true;
-                            break;
-                        }
-                    }
-                    if (!too_close) {
-                        vertices.push_back({x, y});
-                    }
+                if (!point_in_polygon(x, y, boundary_poly)) continue;
+
+                // Reject if inside any hole
+                bool in_hole = false;
+                for (const auto& hole : holes) {
+                    if (point_in_polygon(x, y, hole)) { in_hole = true; break; }
+                }
+                if (in_hole) continue;
+
+                // Reject if too close to any boundary/hole edge
+                bool too_close = false;
+                for (const auto& edge : all_boundary_edges) {
+                    double ex = edge.b.x - edge.a.x;
+                    double ey = edge.b.y - edge.a.y;
+                    double len = std::sqrt(ex*ex + ey*ey);
+                    if (len < 1e-10) continue;
+                    double t = ((x - edge.a.x)*ex + (y - edge.a.y)*ey) / (len*len);
+                    t = std::max(0.0, std::min(1.0, t));
+                    double cx = edge.a.x + t * ex;
+                    double cy = edge.a.y + t * ey;
+                    double dist = std::sqrt((x-cx)*(x-cx) + (y-cy)*(y-cy));
+                    if (dist < margin) { too_close = true; break; }
+                }
+                if (!too_close) {
+                    vertices.push_back({x, y});
                 }
             }
         }
 
-        // 4. Run CDT (Constrained Delaunay Triangulation)
+        // 6. Run CDT (Constrained Delaunay Triangulation)
         CDT::Triangulation<double> cdt;
 
-        // Add all vertices
         std::vector<CDT::V2d<double>> cdt_verts;
         for (const auto& v : vertices) {
             cdt_verts.push_back(CDT::V2d<double>::make(v.x, v.y));
         }
         cdt.insertVertices(cdt_verts);
 
-        // Add boundary edges as constraints
+        // Constraint edges: outer boundary loop
         std::vector<CDT::Edge> edges;
-        for (int i = 0; i < n_boundary; ++i) {
-            edges.push_back(CDT::Edge(i, (i + 1) % n_boundary));
+        for (int i = 0; i < n_outer; ++i) {
+            edges.push_back(CDT::Edge(i, (i + 1) % n_outer));
+        }
+        // Constraint edges: each hole loop (per-loop wrapping)
+        for (size_t h = 0; h < holes.size(); ++h) {
+            int offset = hole_offsets[h];
+            int nh = (int)holes[h].size();
+            for (int i = 0; i < nh; ++i) {
+                edges.push_back(CDT::Edge(offset + i, offset + (i + 1) % nh));
+            }
         }
         cdt.insertEdges(edges);
 
-        // Erase outer triangles and super triangle
+        // Erase outer triangles AND hole triangles (depth peeling)
         cdt.eraseOuterTrianglesAndHoles();
 
-        // 5. Extract triangulation result
-        // CDT may have added Steiner points; rebuild our vertex list from CDT's
+        // 7. Extract triangulation result
+        // Count total boundary vertices for boundary_set
+        int total_boundary_verts = n_outer;
+        for (const auto& hole : holes) total_boundary_verts += (int)hole.size();
+
         vertices.clear();
         boundary_nodes.clear();
-        
-        // CDT vertices include original + any Steiner points
+
         std::set<int> boundary_set;
-        for (int i = 0; i < n_boundary; ++i) {
+        for (int i = 0; i < total_boundary_verts; ++i) {
             boundary_set.insert(i);
         }
 
@@ -174,7 +214,6 @@ public:
             }
         }
 
-        // Extract triangles
         for (const auto& tri : cdt.triangles) {
             elements.push_back({(int)tri.vertices[0], (int)tri.vertices[1], (int)tri.vertices[2]});
         }
@@ -200,7 +239,35 @@ public:
             double theta = 2.0 * M_PI * i / n_boundary;
             boundary.push_back({a * std::cos(theta), b * std::sin(theta)});
         }
-        generate_from_polygon(boundary, density);
+        generate_from_polygon(boundary, {}, density);
+    }
+
+    // ─── Generate Annulus Mesh (ring with hole) ─────────────────────────────
+    void generate_annulus(double outer_r, double inner_r, int density = 15) {
+        // Enforce a strict minimum gap to prevent CDT from crashing due to overlapping boundaries
+        double min_gap = 3.0 / (double)density;
+        if (inner_r >= outer_r - min_gap) {
+            inner_r = std::max(0.01, outer_r - min_gap);
+        }
+        if (inner_r >= outer_r) return; // Fallback safety
+
+        // Outer circle boundary
+        std::vector<Vertex> outer_boundary;
+        int n_outer = std::max(24, (int)(2.0 * M_PI * outer_r * density / (2.0 * outer_r)));
+        for (int i = 0; i < n_outer; ++i) {
+            double theta = 2.0 * M_PI * i / n_outer;
+            outer_boundary.push_back({outer_r * std::cos(theta), outer_r * std::sin(theta)});
+        }
+
+        // Inner circle boundary (same winding direction)
+        std::vector<Vertex> inner_boundary;
+        int n_inner = std::max(16, (int)(2.0 * M_PI * inner_r * density / (2.0 * outer_r)));
+        for (int i = 0; i < n_inner; ++i) {
+            double theta = 2.0 * M_PI * i / n_inner;
+            inner_boundary.push_back({inner_r * std::cos(theta), inner_r * std::sin(theta)});
+        }
+
+        generate_from_polygon(outer_boundary, {inner_boundary}, density);
     }
 
     // ─── Generate Regular N-gon Mesh ────────────────────────────────────────
@@ -217,7 +284,7 @@ public:
             double theta = offset + 2.0 * M_PI * i / n_sides;
             boundary.push_back({circumradius * std::cos(theta), circumradius * std::sin(theta)});
         }
-        generate_from_polygon(boundary, density);
+        generate_from_polygon(boundary, {}, density);
     }
 
     // ─── Generate Isospectral Drums (Gordon-Webb-Wolpert) ───────────────────
@@ -240,8 +307,8 @@ public:
 
         // Generate independent meshes
         Mesh m1, m2;
-        m1.generate_from_polygon(b1, density);
-        m2.generate_from_polygon(b2, density);
+        m1.generate_from_polygon(b1, {}, density);
+        m2.generate_from_polygon(b2, {}, density);
 
         // Center m1 bounding box on X, push left
         // Center m2 bounding box on X, push right

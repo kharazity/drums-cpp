@@ -104,10 +104,25 @@ public:
         int n_conv = eigs.compute(Spectra::SortRule::LargestMagn);
         
         ModeData data;
-        data.eigenvalues = eigs.eigenvalues();
+        Eigen::VectorXd raw_eigenvalues = eigs.eigenvalues();
+        Eigen::MatrixXd raw_eigenvectors = eigs.eigenvectors();
         
-        Eigen::MatrixXd free_eigenvectors = eigs.eigenvectors();
-        data.eigenvectors = Eigen::MatrixXd::Zero(fem.K.rows(), n_modes);
+        // Sort eigenvalues in ascending order
+        std::vector<int> indices(n_conv);
+        for(int i = 0; i < n_conv; ++i) indices[i] = i;
+        
+        std::sort(indices.begin(), indices.end(), [&](int a, int b) {
+            return raw_eigenvalues(a) < raw_eigenvalues(b);
+        });
+
+        data.eigenvalues.resize(n_conv);
+        Eigen::MatrixXd free_eigenvectors(raw_eigenvectors.rows(), n_conv);
+        for(int i = 0; i < n_conv; ++i) {
+            data.eigenvalues(i) = raw_eigenvalues(indices[i]);
+            free_eigenvectors.col(i) = raw_eigenvectors.col(indices[i]);
+        }
+        
+        data.eigenvectors = Eigen::MatrixXd::Zero(fem.K.rows(), n_conv);
         
         // Map eigenvectors back to the full node domain (fixed boundary nodes remain 0)
         for (int i = 0; i < n_free; ++i) {

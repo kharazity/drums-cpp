@@ -85,6 +85,8 @@ struct CoeffSet {
     float E_im[MAX_MODES]   = {};   // Oscillator transition exp(s·dt) imag
     float G_re[MAX_MODES]   = {};   // Forcing coefficient real
     float G_im[MAX_MODES]   = {};   // Forcing coefficient imag
+    float sB_re[MAX_MODES]  = {};   // Forcing correction s·B real
+    float sB_im[MAX_MODES]  = {};   // Forcing correction s·B imag
 };
 
 // ─── Modal State (phasor Z, activity flags) ─────────────────────────────────
@@ -105,7 +107,7 @@ public:
     double tension   = 200.0;       // T (N/m)
     double rho_s     = 0.26;        // Surface density (kg/m²)
     double alpha0    = 5.0;         // Frequency-independent damping (1/s)
-    double alpha1    = 0.0;         // Frequency-proportional damping (s)
+    double alpha1    = 0.01;        // Frequency-proportional damping (s)
     double strike_v0 = 1.0;         // Strike velocity (m/s)
     double strike_width_delta = 0.05; // Spatial mallet strike width (m)
 
@@ -123,12 +125,14 @@ public:
     std::vector<double> xi;         // Phase-centered ξ_j = n_∥·s_j - mean(ξ)
     int n_modes_cached = 0;
 
-    // ─── Three-Buffer Coefficients (lock-free) ──────────────────────────────
+    // ─── Three-Buffer Coefficients (lock-free, fixed staging) ────────────────
+    // coeff[0], coeff[1] = live buffers rotated between cur/fade by callback
+    // coeff[2] = ALWAYS staging (UI writes here, callback never reads directly)
     CoeffSet coeff[3];
-    std::atomic<int> cur_idx{0};        // Callback reads E/G/s² from this
-    std::atomic<int> fade_idx{1};       // Callback reads Phi from this during crossfade
-    int staging_idx = 2;                // UI writes here (callback never touches)
-    std::atomic<bool> update_ready{false};
+    std::atomic<int> cur_idx{0};        // Callback reads E/G/s²/Phi from this
+    std::atomic<int> fade_idx{1};       // Callback crossfades Phi toward this
+    // No staging_idx: staging is always coeff[2]
+    std::atomic<bool> update_ready{false};  // Mailbox flag: UI sets, callback clears
 
     // ─── Crossfade State (only touched by callback) ─────────────────────────
     bool fading = false;
@@ -202,19 +206,35 @@ public:
     // ─── Compute radiation weights (call on tension/direction change) ────────
     // Writes into staging buffer. Sets update_ready for callback to pick up.
     void compute_radiation_weights(const ModeData& modes) {
+        // Mailbox discipline: skip if callback hasn't consumed the last update
+        if (update_ready.load(std::memory_order_acquire)) {
+            return;  // Mailbox full — try again next frame
+        }
+
         int n_modes = modes.eigenvalues.size();
         if (n_modes > MAX_MODES) n_modes = MAX_MODES;
 
         double c = wave_speed();
         const double dt = 1.0 / 44100.0;
+        const double nyquist_limit = 0.45 * 44100.0;  // Nyquist guard
         int J = MU.rows();
 
-        CoeffSet& stg = coeff[staging_idx];
+        CoeffSet& stg = coeff[2];  // Staging is ALWAYS coeff[2]
 
         for (int n = 0; n < n_modes; ++n) {
             double Lambda_n = modes.eigenvalues[n];
             double omega_n = c * std::sqrt(std::max(Lambda_n, 0.0));
             double freq_hz = omega_n / (2.0 * M_PI);
+
+            // Nyquist guard: mute modes that would alias
+            if (freq_hz > nyquist_limit) {
+                stg.E_re[n] = 0.0f; stg.E_im[n] = 0.0f;
+                stg.G_re[n] = 0.0f; stg.G_im[n] = 0.0f;
+                stg.s2_re[n] = 0.0f; stg.s2_im[n] = 0.0f;
+                stg.sB_re[n] = 0.0f; stg.sB_im[n] = 0.0f;
+                stg.Phi_re[n] = 0.0f; stg.Phi_im[n] = 0.0f;
+                continue;
+            }
 
             // Damping (clamped to underdamped regime)
             double d_n = alpha0 + alpha1 * freq_hz;
@@ -230,8 +250,7 @@ public:
             stg.E_re[n] = (float)(exp_decay * std::cos(omega_n * dt));
             stg.E_im[n] = (float)(exp_decay * std::sin(omega_n * dt));
 
-            // G = ((E-1)/s) · norm · 1   (forcing gamma folded in at strike time)
-            // Precompute the per-mode forcing base: ((E-1)/s) · norm
+            // G = ((E-1)/s) · norm
             // norm = 1/(s - s*) = 1/(2·i·ω_n)
             std::complex<double> s_n(-d_n, omega_n);
             std::complex<double> E_n(stg.E_re[n], stg.E_im[n]);
@@ -244,6 +263,11 @@ public:
             }
             stg.G_re[n] = (float)G_base.real();
             stg.G_im[n] = (float)G_base.imag();
+
+            // Forcing correction s·B = s·norm = s / (s - s*)
+            std::complex<double> sB = s_n * norm;
+            stg.sB_re[n] = (float)sB.real();
+            stg.sB_im[n] = (float)sB.imag();
 
             // Radiation weight: Φ_n = Σ_j MU(j,n) · exp(i·k_n·ξ_j)
             double k_n = omega_n / c_air;
@@ -357,16 +381,14 @@ public:
         const double dt = 1.0 / 44100.0;
         const float alpha_step = 1.0f / (FADE_DURATION_S * 44100.0f);
 
-        // --- Check for new coefficient update (once per block) ---
+        // --- Snapshot indices once per block ---
         int ci = engine->cur_idx.load(std::memory_order_acquire);
-        int fi = engine->fade_idx.load(std::memory_order_acquire);
+        int fi = engine->fade_idx.load(std::memory_order_relaxed);
 
+        // --- Check for new coefficient update (once per block) ---
         if (engine->update_ready.load(std::memory_order_acquire)) {
-            // Rotate: staging becomes new fade target
-            int old_fade = fi;
-            fi = engine->staging_idx;
-            engine->fade_idx.store(fi, std::memory_order_release);
-            engine->staging_idx = old_fade;  // Old fade target becomes staging
+            // Copy staging (coeff[2]) into fade target buffer
+            std::memcpy(&engine->coeff[fi], &engine->coeff[2], sizeof(CoeffSet));
             engine->update_ready.store(false, std::memory_order_release);
             engine->fading = true;
             engine->fade_alpha = 0.0f;
@@ -410,6 +432,13 @@ public:
                 float ar = cur_coeff.s2_re[m] * next_zr - cur_coeff.s2_im[m] * next_zi;
                 float ai = cur_coeff.s2_re[m] * next_zi + cur_coeff.s2_im[m] * next_zr;
 
+                // Forcing correction during strike window
+                if (f_t_f > 0.0f) {
+                    float form_f = ss * f_t_f;
+                    ar += cur_coeff.sB_re[m] * form_f;
+                    ai += cur_coeff.sB_im[m] * form_f;
+                }
+
                 // Output: crossfade Phi ONLY (radiation mapping)
                 float pr, pi;
                 if (engine->fading) {
@@ -428,6 +457,8 @@ public:
                 // Deactivate dead modes
                 if (can_deactivate && (next_zr * next_zr + next_zi * next_zi) < 1e-16f) {
                     engine->modes_state.active[m] = 0;
+                    engine->modes_state.Z_re[m] = 0.0f;
+                    engine->modes_state.Z_im[m] = 0.0f;
                 }
             }
 
@@ -449,11 +480,10 @@ public:
 
         // --- Commit fade at block boundary ---
         if (engine->fading && engine->fade_alpha >= 1.0f) {
-            // Fade complete: fade target becomes current
-            int old_cur = ci;
+            // Fade complete: swap cur and fade (both always in {0,1})
             engine->cur_idx.store(fi, std::memory_order_release);
-            // old_cur is now neither cur nor fade; it can be reused as staging
-            // (staging_idx may equal old_cur or not, but that's fine — UI will write there next)
+            engine->fade_idx.store(ci, std::memory_order_relaxed);
+            // Now: cur=fi, fade=ci (old cur becomes new fade target for next update)
             engine->fading = false;
             engine->fade_alpha = 0.0f;
         }

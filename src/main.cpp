@@ -20,7 +20,7 @@ const int SAMPLE_RATE = 44100;
 const int BUFFER_SIZE = 512;
 
 // Drawing Mode
-enum AppMode { PLAY, DRAWING };
+enum AppMode { PLAY, DRAWING, PLACING_HOLE };
 
 // Main Loop
 int main(int argc, char* argv[]) {
@@ -46,7 +46,7 @@ int main(int argc, char* argv[]) {
     int mesh_density = 20;
     
     // Drawing State
-    enum ShapeType { REGULAR_POLYGON, ELLIPSE, ISOSPECTRAL, CUSTOM };
+    enum ShapeType { REGULAR_POLYGON, ELLIPSE, ISOSPECTRAL, CUSTOM, ANNULUS };
     ShapeType current_shape = REGULAR_POLYGON;
     AppMode app_mode = PLAY;
     std::vector<Vertex> draw_points; // Polygon being drawn (world coords)
@@ -57,13 +57,81 @@ int main(int argc, char* argv[]) {
     float ellipse_b = 0.8f;
     int polygon_n = 4;
     float polygon_L = 1.0f;
+    float annulus_outer_r = 1.0f;
+    float annulus_inner_r = 0.4f;
+    
+    // Holes system
+    struct HoleDef {
+        double cx, cy;   // center
+        double a, b;     // semi-major, semi-minor axes
+    };
+    std::vector<HoleDef> shape_holes;
+    float new_hole_a = 0.15f;  // default hole size
+    float new_hole_b = 0.15f;
+    
+    // Shape Control Points (for interactive editing in play mode)
+    std::vector<Vertex> shape_control_points;
+    int dragged_cp_idx = -1;
+    bool cp_dirty = false;
+    
+    // Initialize control points for default shape (4-sided regular polygon, L=1.0)
+    {
+        double circumradius = polygon_L / (2.0 * std::sin(M_PI / polygon_n));
+        double offset = M_PI / 2.0 - M_PI / polygon_n;
+        for (int i = 0; i < polygon_n; ++i) {
+            double theta = offset + 2.0 * M_PI * i / polygon_n;
+            shape_control_points.push_back({circumradius * std::cos(theta), circumradius * std::sin(theta)});
+        }
+    }
     
     // Spectrum Data
     std::vector<float> freqs;
     std::vector<float> amps;
     int last_struck_mesh = 0;
     int dragged_mesh_idx = -1;
+    int dragged_draw_point_idx = -1;
     char export_wav_path[256] = "output/strike.wav";
+    
+    // ── Helper: compute outer boundary polygon for current shape ────────
+    auto compute_outer_boundary = [&]() -> std::vector<Vertex> {
+        std::vector<Vertex> boundary;
+        if (current_shape == ELLIPSE) {
+            double a = ellipse_a, b = ellipse_b;
+            double h = std::pow(a - b, 2) / std::pow(a + b, 2);
+            double perimeter = M_PI * (a + b) * (1.0 + (3.0 * h) / (10.0 + std::sqrt(4.0 - 3.0 * h)));
+            double scale = 2.0 * std::max(a, b);
+            int n = std::max(16, (int)(perimeter / (scale / mesh_density)));
+            for (int i = 0; i < n; ++i) {
+                double theta = 2.0 * M_PI * i / n;
+                boundary.push_back({a * std::cos(theta), b * std::sin(theta)});
+            }
+        } else if (current_shape == REGULAR_POLYGON) {
+            double circumradius = polygon_L / (2.0 * std::sin(M_PI / polygon_n));
+            double offset = M_PI / 2.0 - M_PI / polygon_n;
+            for (int i = 0; i < polygon_n; ++i) {
+                double theta = offset + 2.0 * M_PI * i / polygon_n;
+                boundary.push_back({circumradius * std::cos(theta), circumradius * std::sin(theta)});
+            }
+        } else if (current_shape == CUSTOM && !active_polygon.empty()) {
+            boundary = active_polygon;
+        }
+        return boundary;
+    };
+    
+    // ── Helper: convert HoleDefs to polygon vectors ─────────────────────
+    auto holes_to_polygons = [&]() -> std::vector<std::vector<Vertex>> {
+        std::vector<std::vector<Vertex>> polys;
+        for (const auto& h : shape_holes) {
+            std::vector<Vertex> poly;
+            int n = std::max(16, (int)(mesh_density * 0.5));
+            for (int i = 0; i < n; ++i) {
+                double theta = 2.0 * M_PI * i / n;
+                poly.push_back({h.cx + h.a * std::cos(theta), h.cy + h.b * std::sin(theta)});
+            }
+            polys.push_back(poly);
+        }
+        return polys;
+    };
     
     // ────────────────────────────────────────────────────────────────────────
 
@@ -156,11 +224,12 @@ int main(int argc, char* argv[]) {
                 ImGui::Separator();
                 
                 // ── Shape Selection ──────────────────────────────────────
-                const char* shape_names[] = { "Regular Polygon", "Ellipse", "Isospectral Drums", "Custom (Draw)" };
+                const char* shape_names[] = { "Regular Polygon", "Ellipse", "Isospectral Drums", "Custom (Draw)", "Annulus" };
                 int current_shape_idx = (int)current_shape;
                 
                 if (ImGui::Combo("Shape Type", &current_shape_idx, shape_names, IM_ARRAYSIZE(shape_names))) {
                     current_shape = (ShapeType)current_shape_idx;
+                    shape_holes.clear();  // Clear holes when switching shapes
                     if (current_shape == CUSTOM) {
                         app_mode = DRAWING;
                         draw_points.clear();
@@ -171,11 +240,24 @@ int main(int argc, char* argv[]) {
                 
                 // Shape-specific parameters
                 if (current_shape == ELLIPSE) {
-                    ImGui::SliderFloat("Semi-major (a)", &ellipse_a, 0.1f, 3.0f);
-                    ImGui::SliderFloat("Semi-minor (b)", &ellipse_b, 0.1f, 3.0f);
+                    float min_axis = 3.0f / (float)mesh_density;  // Lower bound: 3 mesh units
+                    ImGui::InputFloat("Semi-major (a)", &ellipse_a, 0.01f, 0.1f, "%.3f");
+                    if (ellipse_a < min_axis) ellipse_a = min_axis;
+                    ImGui::InputFloat("Semi-minor (b)", &ellipse_b, 0.01f, 0.1f, "%.3f");
+                    if (ellipse_b < min_axis) ellipse_b = min_axis;
+                    ImGui::TextDisabled("(min: %.4f based on mesh density)", min_axis);
                 } else if (current_shape == REGULAR_POLYGON) {
                     ImGui::SliderInt("Sides (n)", &polygon_n, 3, 20);
                     ImGui::SliderFloat("Side Length (L)", &polygon_L, 0.1f, 3.0f);
+                } else if (current_shape == ANNULUS) {
+                    float min_gap = 3.0f / (float)mesh_density;
+                    ImGui::InputFloat("Outer Radius", &annulus_outer_r, 0.01f, 0.1f, "%.3f");
+                    if (annulus_outer_r < 2.0f * min_gap) annulus_outer_r = 2.0f * min_gap;
+                    ImGui::InputFloat("Inner Radius", &annulus_inner_r, 0.01f, 0.1f, "%.3f");
+                    if (annulus_inner_r < min_gap) annulus_inner_r = min_gap;
+                    if (annulus_inner_r >= annulus_outer_r - min_gap)
+                        annulus_inner_r = annulus_outer_r - min_gap;
+                    ImGui::TextDisabled("(gap min: %.4f)", min_gap);
                 }
 
                 // Parameters requiring Rebuild
@@ -186,18 +268,103 @@ int main(int argc, char* argv[]) {
                 if (mesh_density < 5) mesh_density = 5;
                 if (mesh_density > 1000000) mesh_density = 1000000;
 
-                if (app_mode == PLAY) {
+                if (app_mode == PLAY || app_mode == PLACING_HOLE) {
+                    // ── Holes UI ─────────────────────────────────────────
+                    if (current_shape != ISOSPECTRAL && current_shape != ANNULUS) {
+                        ImGui::Separator();
+                        bool holes_open = ImGui::TreeNodeEx("Holes", ImGuiTreeNodeFlags_DefaultOpen,
+                                                            "Holes  (%d placed)", (int)shape_holes.size());
+                        if (holes_open) {
+                            ImGui::Indent(4.0f);
+                            
+                            bool hole_size_changed = false;
+                            float min_gap = std::max(0.01f, 3.0f / (float)mesh_density);
+                            hole_size_changed |= ImGui::InputFloat("a (semi-major)", &new_hole_a, 0.01f, 0.05f, "%.3f");
+                            if (new_hole_a < min_gap) new_hole_a = min_gap;
+                            hole_size_changed |= ImGui::InputFloat("b (semi-minor)", &new_hole_b, 0.01f, 0.05f, "%.3f");
+                            if (new_hole_b < min_gap) new_hole_b = min_gap;
+
+                            // Live-update all existing holes when a/b change
+                            if (hole_size_changed && !shape_holes.empty()) {
+                                for (auto& h : shape_holes) {
+                                    h.a = new_hole_a;
+                                    h.b = new_hole_b;
+                                }
+                                meshes.assign(1, Mesh());
+                                auto hole_polys = holes_to_polygons();
+                                auto outer = compute_outer_boundary();
+                                if (!outer.empty()) {
+                                    meshes[0].generate_from_polygon(outer, hole_polys, mesh_density);
+                                }
+                                fems.clear();
+                                all_modes.clear();
+                                if (meshes[0].elements.size() > 0) {
+                                    FEM f;
+                                    f.assemble(meshes[0]);
+                                    fems.push_back(f);
+                                    all_modes.push_back(Solver::solve(f, n_modes));
+                                    audio.precompute_MU(fems[0], all_modes[0]);
+                                    audio.compute_xi(meshes[0]);
+                                    audio.compute_radiation_weights(all_modes[0]);
+                                }
+                            }
+
+                            ImGui::Spacing();
+                            if (app_mode == PLACING_HOLE) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "[+] Click canvas to place hole");
+                                if (ImGui::Button("Cancel")) app_mode = PLAY;
+                            } else {
+                                if (ImGui::Button("Add Hole")) app_mode = PLACING_HOLE;
+                                if (!shape_holes.empty()) {
+                                    ImGui::SameLine();
+                                    if (ImGui::Button("Clear All")) shape_holes.clear();
+                                }
+                            }
+                            ImGui::Unindent(4.0f);
+                            ImGui::TreePop();
+                        }
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Spacing();
+                    ImGui::Separator();
+
                     if (ImGui::Button("Rebuild Mesh")) {
                         if (current_shape == ISOSPECTRAL) {
                             meshes = Mesh::generate_isospectral(mesh_density);
+                            shape_control_points.clear();
                         } else {
                             meshes.assign(1, Mesh());
+                            auto hole_polys = holes_to_polygons();
+                            
                             if (current_shape == ELLIPSE) {
-                                meshes[0].generate_ellipse(ellipse_a, ellipse_b, mesh_density);
+                                if (hole_polys.empty()) {
+                                    meshes[0].generate_ellipse(ellipse_a, ellipse_b, mesh_density);
+                                } else {
+                                    auto outer = compute_outer_boundary();
+                                    meshes[0].generate_from_polygon(outer, hole_polys, mesh_density);
+                                }
+                                shape_control_points = {{(double)ellipse_a, 0.0}, {0.0, (double)ellipse_b}};
                             } else if (current_shape == REGULAR_POLYGON) {
-                                meshes[0].generate_regular_polygon(polygon_n, polygon_L, mesh_density);
+                                if (hole_polys.empty()) {
+                                    meshes[0].generate_regular_polygon(polygon_n, polygon_L, mesh_density);
+                                } else {
+                                    auto outer = compute_outer_boundary();
+                                    meshes[0].generate_from_polygon(outer, hole_polys, mesh_density);
+                                }
+                                shape_control_points.clear();
+                                double circumradius = polygon_L / (2.0 * std::sin(M_PI / polygon_n));
+                                double offset = M_PI / 2.0 - M_PI / polygon_n;
+                                for (int i = 0; i < polygon_n; ++i) {
+                                    double theta = offset + 2.0 * M_PI * i / polygon_n;
+                                    shape_control_points.push_back({circumradius * std::cos(theta), circumradius * std::sin(theta)});
+                                }
                             } else if (current_shape == CUSTOM && !active_polygon.empty()) {
-                                meshes[0].generate_from_polygon(active_polygon, mesh_density);
+                                meshes[0].generate_from_polygon(active_polygon, hole_polys, mesh_density);
+                                shape_control_points = active_polygon;
+                            } else if (current_shape == ANNULUS) {
+                                meshes[0].generate_annulus(annulus_outer_r, annulus_inner_r, mesh_density);
+                                shape_control_points = {{(double)annulus_outer_r, 0.0}, {(double)annulus_inner_r, 0.0}};
                             }
                         }
                         
@@ -238,7 +405,7 @@ int main(int argc, char* argv[]) {
                             // Close polygon and mesh it
                             active_polygon = draw_points;
                             meshes.assign(1, Mesh());
-                            meshes[0].generate_from_polygon(active_polygon, mesh_density);
+                            meshes[0].generate_from_polygon(active_polygon, {}, mesh_density);
                             
                             fems.clear();
                             all_modes.clear();
@@ -259,6 +426,7 @@ int main(int argc, char* argv[]) {
                                     memset(audio.modes_state.active, 0, sizeof(audio.modes_state.active));
                                 }
                             }
+                            shape_control_points = active_polygon;  // Custom polygon control points
                             app_mode = PLAY;
                             draw_points.clear();
                         }
@@ -293,7 +461,7 @@ int main(int argc, char* argv[]) {
                     if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
                 }
                 static float alpha1_f = (float)audio.alpha1;
-                if (ImGui::SliderFloat("Freq Damping (a1)", &alpha1_f, 0.0f, 0.01f, "%.5f")) {
+                if (ImGui::SliderFloat("Freq Damping (a1)", &alpha1_f, 0.0f, 0.05f, "%.5f")) {
                     audio.alpha1 = (double)alpha1_f;
                     if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
                 }
@@ -383,113 +551,274 @@ int main(int argc, char* argv[]) {
 
                 // ── DRAWING MODE ─────────────────────────────────────────
                 if (app_mode == DRAWING) {
-                    // Add invisible button to capture clicks in the window area
+                    // Use InvisibleButton to capture all mouse interaction
                     ImGui::InvisibleButton("draw_canvas", sz);
-                    
-                    if (ImGui::IsItemClicked(0)) {
-                        ImVec2 mouse_pos = ImGui::GetMousePos();
-                        // Convert screen coords → world coords
-                        double wx = (mouse_pos.x - center.x) / zoom;
-                        double wy = -(mouse_pos.y - center.y) / zoom;
-                        draw_points.push_back({wx, wy});
-                    }
-                    
-                    // Draw existing points and edges
+                    bool canvas_hovered = ImGui::IsItemHovered();
+                    ImVec2 mouse_pos = ImGui::GetMousePos();
+
+                    // Convert mouse to world coords
+                    double wx = (mouse_pos.x - center.x) / zoom;
+                    double wy = -(mouse_pos.y - center.y) / zoom;
+
+                    // Hit-test radius in screen pixels
+                    const float HIT_RADIUS = 10.0f;
+
+                    // Find which vertex (if any) is under the mouse
+                    int hovered_vertex = -1;
                     for (int i = 0; i < (int)draw_points.size(); ++i) {
                         ImVec2 sp = ImVec2(center.x + draw_points[i].x * zoom,
                                            center.y - draw_points[i].y * zoom);
-                        
-                        // Draw vertex dot
-                        draw_list->AddCircleFilled(sp, 5.0f, IM_COL32(255, 200, 50, 255));
-                        
-                        // Draw edge to next point
-                        if (i > 0) {
-                            ImVec2 prev = ImVec2(center.x + draw_points[i-1].x * zoom,
-                                                 center.y - draw_points[i-1].y * zoom);
-                            draw_list->AddLine(prev, sp, IM_COL32(255, 200, 50, 200), 2.5f);
+                        float dx = mouse_pos.x - sp.x, dy = mouse_pos.y - sp.y;
+                        if (dx*dx + dy*dy <= HIT_RADIUS*HIT_RADIUS) {
+                            hovered_vertex = i;
+                            break;
                         }
                     }
-                    
-                    // Draw closing edge preview (dotted feel via thinner line)
+
+                    // Mouse button down: start drag or add point
+                    if (canvas_hovered && ImGui::IsMouseClicked(0)) {
+                        if (hovered_vertex != -1) {
+                            dragged_draw_point_idx = hovered_vertex;  // Start dragging
+                        } else {
+                            draw_points.push_back({wx, wy});           // Add new vertex
+                        }
+                    }
+
+                    // Continue dragging
+                    if (dragged_draw_point_idx != -1 && ImGui::IsMouseDown(0)) {
+                        draw_points[dragged_draw_point_idx].x = wx;
+                        draw_points[dragged_draw_point_idx].y = wy;
+                    }
+
+                    // Release drag
+                    if (ImGui::IsMouseReleased(0)) {
+                        dragged_draw_point_idx = -1;
+                    }
+
+                    // Draw edges
+                    for (int i = 0; i < (int)draw_points.size(); ++i) {
+                        if (i > 0) {
+                            ImVec2 a = ImVec2(center.x + draw_points[i-1].x * zoom,
+                                              center.y - draw_points[i-1].y * zoom);
+                            ImVec2 b = ImVec2(center.x + draw_points[i].x * zoom,
+                                              center.y - draw_points[i].y * zoom);
+                            draw_list->AddLine(a, b, IM_COL32(255, 200, 50, 200), 2.5f);
+                        }
+                    }
+
+                    // Closing edge preview
                     if (draw_points.size() >= 3) {
                         ImVec2 first = ImVec2(center.x + draw_points[0].x * zoom,
                                               center.y - draw_points[0].y * zoom);
-                        ImVec2 last = ImVec2(center.x + draw_points.back().x * zoom,
-                                             center.y - draw_points.back().y * zoom);
+                        ImVec2 last  = ImVec2(center.x + draw_points.back().x * zoom,
+                                              center.y - draw_points.back().y * zoom);
                         draw_list->AddLine(last, first, IM_COL32(255, 200, 50, 100), 1.5f);
                     }
-                    
-                    // Draw cursor line from last point to mouse
-                    if (!draw_points.empty()) {
+
+                    // Draw vertices (red dots; highlight hover=white, drag=cyan)
+                    for (int i = 0; i < (int)draw_points.size(); ++i) {
+                        ImVec2 sp = ImVec2(center.x + draw_points[i].x * zoom,
+                                           center.y - draw_points[i].y * zoom);
+                        ImU32 col;
+                        float r;
+                        if (i == dragged_draw_point_idx) {
+                            col = IM_COL32(0, 220, 255, 255);  // Cyan: dragging
+                            r = 8.0f;
+                        } else if (i == hovered_vertex) {
+                            col = IM_COL32(255, 255, 255, 255); // White: hover
+                            r = 7.0f;
+                        } else {
+                            col = IM_COL32(220, 60, 60, 255);   // Red: normal
+                            r = 5.0f;
+                        }
+                        draw_list->AddCircleFilled(sp, r, col);
+                        draw_list->AddCircle(sp, r + 1.5f, IM_COL32(0,0,0,120), 0, 1.5f);
+                    }
+
+                    // Cursor trail from last point to mouse (only when not about to drag)
+                    if (!draw_points.empty() && hovered_vertex == -1 && dragged_draw_point_idx == -1) {
                         ImVec2 last_sp = ImVec2(center.x + draw_points.back().x * zoom,
                                                 center.y - draw_points.back().y * zoom);
-                        draw_list->AddLine(last_sp, ImGui::GetMousePos(), IM_COL32(255, 255, 255, 100), 1.0f);
+                        draw_list->AddLine(last_sp, mouse_pos, IM_COL32(255, 255, 255, 80), 1.0f);
                     }
-                    
+
                     // Help text
-                    draw_list->AddText(ImVec2(p0.x + 10, p0.y + 10), IM_COL32(255, 200, 50, 255), 
-                                       "Click to add points. Use 'Finish & Build' when done.");
+                    const char* hint = (hovered_vertex != -1)
+                        ? "Drag vertex to reshape. Click empty space to add."
+                        : (draw_points.size() >= 3)
+                            ? "Click to add points. Drag red dots to adjust. 'Finish & Build' when done."
+                            : "Click to add polygon vertices.";
+                    draw_list->AddText(ImVec2(p0.x + 10, p0.y + 10), IM_COL32(255, 200, 50, 255), hint);
                 }
                 // ── PLAY MODE ────────────────────────────────────────────
                 else {
                     // Add invisible button to capture clicks in the window area so the window doesn't drag
                     ImGui::InvisibleButton("play_canvas", sz);
+                    bool play_hovered = ImGui::IsItemHovered();
                     
-                    // Interaction: Strike and Drag
+                    // Interaction: Control Point Drag + Strike + Mesh Drag
                     ImVec2 mouse_pos = ImGui::GetMousePos();
                     double wx = (mouse_pos.x - center.x) / zoom;
                     double wy = -(mouse_pos.y - center.y) / zoom;
                     
-                    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) {
-                        int closest_node = -1;
-                        int hit_mesh_idx = -1;
-                        
-                        // 1. First check if we actually clicked inside a triangle using Barycentric coordinates
-                        for (size_t m_idx = 0; m_idx < meshes.size(); ++m_idx) {
-                            const auto& sub_mesh = meshes[m_idx];
-                            for (const auto& el : sub_mesh.elements) {
-                                Vertex v1 = sub_mesh.vertices[el.v[0]];
-                                Vertex v2 = sub_mesh.vertices[el.v[1]];
-                                Vertex v3 = sub_mesh.vertices[el.v[2]];
-                                
-                                double denom = ((v2.y - v3.y)*(v1.x - v3.x) + (v3.x - v2.x)*(v1.y - v3.y));
-                                if (std::abs(denom) < 1e-12) continue;
-                                
-                                double a = ((v2.y - v3.y)*(wx - v3.x) + (v3.x - v2.x)*(wy - v3.y)) / denom;
-                                double b = ((v3.y - v1.y)*(wx - v3.x) + (v1.x - v3.x)*(wy - v3.y)) / denom;
-                                double c = 1.0 - a - b;
-                                
-                                // Slight margin for floating point on edges
-                                if (a >= -1e-6 && b >= -1e-6 && c >= -1e-6) {
-                                    // 2. If inside, find the closest of its 3 governing vertices to center the strike
-                                    double d1 = (wx - v1.x)*(wx - v1.x) + (wy - v1.y)*(wy - v1.y);
-                                    double d2 = (wx - v2.x)*(wx - v2.x) + (wy - v2.y)*(wy - v2.y);
-                                    double d3 = (wx - v3.x)*(wx - v3.x) + (wy - v3.y)*(wy - v3.y);
-                                    
-                                    if (d1 <= d2 && d1 <= d3) closest_node = el.v[0];
-                                    else if (d2 <= d1 && d2 <= d3) closest_node = el.v[1];
-                                    else closest_node = el.v[2];
-                                    
-                                    hit_mesh_idx = m_idx;
-                                    break;
-                                }
-                            }
-                            if (hit_mesh_idx != -1) break;
-                        }
-                        
-                        if (hit_mesh_idx != -1) {
-                            dragged_mesh_idx = hit_mesh_idx; // Begin dragging
-                            last_struck_mesh = hit_mesh_idx;
-                            // Far-field radiation: no pickup node needed
-                            audio.trigger_strike(meshes[hit_mesh_idx], all_modes[hit_mesh_idx], wx, wy, 1.0);
+                    // ── Control Point Hover Detection ────────────────────
+                    const float CP_HIT_RADIUS = 12.0f;
+                    int hovered_cp = -1;
+                    for (int i = 0; i < (int)shape_control_points.size(); ++i) {
+                        ImVec2 sp = ImVec2(center.x + shape_control_points[i].x * zoom,
+                                           center.y - shape_control_points[i].y * zoom);
+                        float dx = mouse_pos.x - sp.x, dy = mouse_pos.y - sp.y;
+                        if (dx*dx + dy*dy <= CP_HIT_RADIUS*CP_HIT_RADIUS) {
+                            hovered_cp = i;
+                            break;
                         }
                     }
                     
+                    // ── Mouse Click: prioritize control point grab over strike ──
+                    if (play_hovered && ImGui::IsMouseClicked(0)) {
+                        if (app_mode == PLACING_HOLE) {
+                            // Place a hole at click position
+                            shape_holes.push_back({wx, wy, (double)new_hole_a, (double)new_hole_b});
+                            app_mode = PLAY;
+                            
+                            // Auto-rebuild mesh with the new hole
+                            meshes.assign(1, Mesh());
+                            auto hole_polys = holes_to_polygons();
+                            auto outer = compute_outer_boundary();
+                            if (!outer.empty()) {
+                                meshes[0].generate_from_polygon(outer, hole_polys, mesh_density);
+                            }
+                            
+                            fems.clear();
+                            all_modes.clear();
+                            if (meshes[0].elements.size() > 0) {
+                                FEM f;
+                                f.assemble(meshes[0]);
+                                fems.push_back(f);
+                                all_modes.push_back(Solver::solve(f, n_modes));
+                                audio.precompute_MU(fems[0], all_modes[0]);
+                                audio.compute_xi(meshes[0]);
+                                audio.compute_radiation_weights(all_modes[0]);
+                            }
+                        } else if (hovered_cp != -1) {
+                            // Grab control point
+                            dragged_cp_idx = hovered_cp;
+                        } else {
+                            // Strike the drum
+                            int hit_mesh_idx = -1;
+                            for (size_t m_idx = 0; m_idx < meshes.size(); ++m_idx) {
+                                const auto& sub_mesh = meshes[m_idx];
+                                for (const auto& el : sub_mesh.elements) {
+                                    Vertex v1 = sub_mesh.vertices[el.v[0]];
+                                    Vertex v2 = sub_mesh.vertices[el.v[1]];
+                                    Vertex v3 = sub_mesh.vertices[el.v[2]];
+                                    double denom = ((v2.y - v3.y)*(v1.x - v3.x) + (v3.x - v2.x)*(v1.y - v3.y));
+                                    if (std::abs(denom) < 1e-12) continue;
+                                    double a = ((v2.y - v3.y)*(wx - v3.x) + (v3.x - v2.x)*(wy - v3.y)) / denom;
+                                    double b = ((v3.y - v1.y)*(wx - v3.x) + (v1.x - v3.x)*(wy - v3.y)) / denom;
+                                    double c = 1.0 - a - b;
+                                    if (a >= -1e-6 && b >= -1e-6 && c >= -1e-6) {
+                                        hit_mesh_idx = m_idx;
+                                        break;
+                                    }
+                                }
+                                if (hit_mesh_idx != -1) break;
+                            }
+                            if (hit_mesh_idx != -1) {
+                                dragged_mesh_idx = hit_mesh_idx;
+                                last_struck_mesh = hit_mesh_idx;
+                                audio.trigger_strike(meshes[hit_mesh_idx], all_modes[hit_mesh_idx], wx, wy, 1.0);
+                            }
+                        }
+                    }
+                    
+                    // ── Control Point Dragging ───────────────────────────
+                    if (dragged_cp_idx != -1 && ImGui::IsMouseDown(0)) {
+                        if (current_shape == ELLIPSE) {
+                            // Ellipse: constrain axis handles
+                            double min_gap = std::max(0.01, 3.0 / (double)mesh_density);
+                            if (dragged_cp_idx == 0) {
+                                shape_control_points[0].x = std::max(min_gap, std::abs(wx));
+                                shape_control_points[0].y = 0.0;
+                            } else {
+                                shape_control_points[1].x = 0.0;
+                                shape_control_points[1].y = std::max(min_gap, std::abs(wy));
+                            }
+                        } else if (current_shape == ANNULUS) {
+                            // Annulus: both handles on x-axis, with gap constraint
+                            double min_gap = 3.0 / (double)mesh_density;
+                            double r = std::max(min_gap, std::abs(wx));
+                            if (dragged_cp_idx == 0) {
+                                // Outer radius handle
+                                if (r <= shape_control_points[1].x + min_gap)
+                                    r = shape_control_points[1].x + min_gap;
+                                shape_control_points[0] = {r, 0.0};
+                            } else {
+                                // Inner radius handle
+                                if (r >= shape_control_points[0].x - min_gap)
+                                    r = shape_control_points[0].x - min_gap;
+                                shape_control_points[1] = {r, 0.0};
+                            }
+                        } else {
+                            // Polygon: free movement
+                            shape_control_points[dragged_cp_idx].x = wx;
+                            shape_control_points[dragged_cp_idx].y = wy;
+                        }
+                        cp_dirty = true;
+                    }
+                    
+                    // ── Mouse Release: rebuild if control points changed ─
                     if (ImGui::IsMouseReleased(0)) {
+                        if (dragged_cp_idx != -1 && cp_dirty) {
+                            // Rebuild mesh from updated control points
+                            meshes.assign(1, Mesh());
+                            if (current_shape == ELLIPSE) {
+                                ellipse_a = (float)shape_control_points[0].x;
+                                ellipse_b = (float)shape_control_points[1].y;
+                                auto hole_polys = holes_to_polygons();
+                                if (hole_polys.empty()) {
+                                    meshes[0].generate_ellipse(ellipse_a, ellipse_b, mesh_density);
+                                } else {
+                                    auto outer = compute_outer_boundary();
+                                    meshes[0].generate_from_polygon(outer, hole_polys, mesh_density);
+                                }
+                            } else if (current_shape == ANNULUS) {
+                                annulus_outer_r = (float)shape_control_points[0].x;
+                                annulus_inner_r = (float)shape_control_points[1].x;
+                                meshes[0].generate_annulus(annulus_outer_r, annulus_inner_r, mesh_density);
+                            } else {
+                                // Regular polygon or custom: use control points as polygon
+                                active_polygon = shape_control_points;
+                                current_shape = CUSTOM;
+                                auto hole_polys = holes_to_polygons();
+                                meshes[0].generate_from_polygon(active_polygon, hole_polys, mesh_density);
+                            }
+                            
+                            fems.clear();
+                            all_modes.clear();
+                            if (meshes[0].elements.size() > 0) {
+                                FEM f;
+                                f.assemble(meshes[0]);
+                                fems.push_back(f);
+                                all_modes.push_back(Solver::solve(f, n_modes));
+                                audio.precompute_MU(fems[0], all_modes[0]);
+                                audio.compute_xi(meshes[0]);
+                                audio.compute_radiation_weights(all_modes[0]);
+                                freqs.clear();
+                                {
+                                    std::lock_guard<std::mutex> lock(audio.mutex);
+                                    audio.modes_state.count = 0;
+                                    memset(audio.modes_state.active, 0, sizeof(audio.modes_state.active));
+                                }
+                            }
+                            cp_dirty = false;
+                        }
+                        dragged_cp_idx = -1;
                         dragged_mesh_idx = -1;
                     }
                     
-                    if (ImGui::IsMouseDragging(0) && dragged_mesh_idx != -1 && dragged_mesh_idx < (int)meshes.size()) {
+                    // ── Mesh Dragging (whole mesh translate) ─────────────
+                    if (dragged_cp_idx == -1 && ImGui::IsMouseDragging(0) && dragged_mesh_idx != -1 && dragged_mesh_idx < (int)meshes.size()) {
                         ImVec2 delta = ImGui::GetIO().MouseDelta;
                         double dx = delta.x / zoom;
                         double dy = -delta.y / zoom;
@@ -499,7 +828,7 @@ int main(int argc, char* argv[]) {
                         }
                     }
     
-                    // Draw Mesh Triangles
+                    // ── Draw Mesh Triangles ──────────────────────────────
                     for (const auto& m : meshes) {
                         for (const auto& el : m.elements) {
                             ImVec2 p[3];
@@ -511,13 +840,73 @@ int main(int argc, char* argv[]) {
                             draw_list->AddTriangle(p[0], p[1], p[2], IM_COL32(100, 150, 200, 200), 1.0f);
                         }
                         
-                        // Draw boundary nodes as bright dots
+                        // Draw boundary nodes as small dots
                         for (int idx : m.boundary_nodes) {
                             if (idx >= 0 && idx < (int)m.vertices.size()) {
                                 ImVec2 bp = ImVec2(center.x + m.vertices[idx].x * zoom,
                                                    center.y - m.vertices[idx].y * zoom);
-                                draw_list->AddCircleFilled(bp, 3.0f, IM_COL32(255, 100, 100, 200));
+                                draw_list->AddCircleFilled(bp, 2.0f, IM_COL32(255, 100, 100, 120));
                             }
+                        }
+                    }
+                    
+                    // ── Draw Control Points ──────────────────────────────
+                    for (int i = 0; i < (int)shape_control_points.size(); ++i) {
+                        ImVec2 sp = ImVec2(center.x + shape_control_points[i].x * zoom,
+                                           center.y - shape_control_points[i].y * zoom);
+                        ImU32 col;
+                        float r;
+                        if (i == dragged_cp_idx) {
+                            col = IM_COL32(0, 220, 255, 255);    // Cyan: dragging
+                            r = 9.0f;
+                        } else if (i == hovered_cp) {
+                            col = IM_COL32(255, 255, 255, 255);  // White: hover
+                            r = 8.0f;
+                        } else {
+                            col = IM_COL32(220, 60, 60, 255);    // Red: normal
+                            r = 6.0f;
+                        }
+                        draw_list->AddCircleFilled(sp, r, col);
+                        draw_list->AddCircle(sp, r + 1.5f, IM_COL32(0, 0, 0, 150), 0, 1.5f);
+                        
+                        // Label for ellipse/annulus handles
+                        if (current_shape == ELLIPSE) {
+                            const char* label = (i == 0) ? "a" : "b";
+                            draw_list->AddText(ImVec2(sp.x + r + 4, sp.y - 6), IM_COL32(255, 200, 100, 200), label);
+                        } else if (current_shape == ANNULUS) {
+                            const char* label = (i == 0) ? "R" : "r";
+                            draw_list->AddText(ImVec2(sp.x + r + 4, sp.y - 6), IM_COL32(255, 200, 100, 200), label);
+                        }
+                    }
+                    
+                    // ── Draw Hole Outlines ───────────────────────────────
+                    for (const auto& h : shape_holes) {
+                        int n_seg = 48;
+                        for (int i = 0; i < n_seg; ++i) {
+                            double t0 = 2.0 * M_PI * i / n_seg;
+                            double t1 = 2.0 * M_PI * (i + 1) / n_seg;
+                            ImVec2 p0(center.x + (h.cx + h.a * std::cos(t0)) * zoom,
+                                      center.y - (h.cy + h.b * std::sin(t0)) * zoom);
+                            ImVec2 p1(center.x + (h.cx + h.a * std::cos(t1)) * zoom,
+                                      center.y - (h.cy + h.b * std::sin(t1)) * zoom);
+                            draw_list->AddLine(p0, p1, IM_COL32(255, 80, 255, 200), 2.0f);
+                        }
+                        // Center dot
+                        ImVec2 hc(center.x + h.cx * zoom, center.y - h.cy * zoom);
+                        draw_list->AddCircleFilled(hc, 3.0f, IM_COL32(255, 80, 255, 180));
+                    }
+                    
+                    // ── Preview hole at cursor during PLACING_HOLE ───────
+                    if (app_mode == PLACING_HOLE && play_hovered) {
+                        int n_seg = 48;
+                        for (int i = 0; i < n_seg; ++i) {
+                            double t0 = 2.0 * M_PI * i / n_seg;
+                            double t1 = 2.0 * M_PI * (i + 1) / n_seg;
+                            ImVec2 p0(center.x + (wx + new_hole_a * std::cos(t0)) * zoom,
+                                      center.y - (wy + new_hole_b * std::sin(t0)) * zoom);
+                            ImVec2 p1(center.x + (wx + new_hole_a * std::cos(t1)) * zoom,
+                                      center.y - (wy + new_hole_b * std::sin(t1)) * zoom);
+                            draw_list->AddLine(p0, p1, IM_COL32(255, 200, 50, 120), 1.5f);
                         }
                     }
                 }
@@ -541,32 +930,46 @@ int main(int argc, char* argv[]) {
                 if (!all_modes.empty()) {
                     const ModeData& active_modes_data = all_modes[last_struck_mesh];
                     
-                    // Update Data (use physical frequencies)
+                    // Update Data Sizes
                     if (freqs.size() != active_modes_data.eigenvalues.size()) {
                         freqs.resize(active_modes_data.eigenvalues.size());
                         amps.resize(active_modes_data.eigenvalues.size());
-                        for(size_t i = 0; i < active_modes_data.eigenvalues.size(); ++i) {
-                            freqs[i] = (float)audio.eigenvalue_to_freq(active_modes_data.eigenvalues[i]);
-                            amps[i] = 0.0f; 
-                        }
+                    }
+                    
+                    // ALWAYS update physical frequencies
+                    for(size_t i = 0; i < active_modes_data.eigenvalues.size(); ++i) {
+                        freqs[i] = (float)audio.eigenvalue_to_freq(active_modes_data.eigenvalues[i]);
                     }
                     
                     // Get current amplitudes from Audio Engine (in dB)
+                    // Show radiated pressure per mode (not raw displacement)
                     {
                         std::lock_guard<std::mutex> lock(audio.mutex);
+                        int ci = audio.cur_idx.load(std::memory_order_acquire);
+                        const CoeffSet& cc = audio.coeff[ci];
+                        double phys_scale = audio.rho_air / (2.0 * M_PI * audio.listener_distance);
+                        
                         if (audio.modes_state.count == (int)active_modes_data.eigenvalues.size()) {
                             for(size_t i = 0; i < active_modes_data.eigenvalues.size(); ++i) {
                                 float zr = audio.modes_state.Z_re[i];
                                 float zi = audio.modes_state.Z_im[i];
-                                float mag = std::sqrt(zr*zr + zi*zi);
-                                amps[i] = (mag > 1e-20f) ? 20.0f * std::log10(mag) : -120.0f;
+                                // Acceleration: a = s²·Z
+                                float ar = cc.s2_re[i] * zr - cc.s2_im[i] * zi;
+                                float ai = cc.s2_re[i] * zi + cc.s2_im[i] * zr;
+                                float p = 2.0f * (cc.Phi_re[i] * ar + cc.Phi_im[i] * ai) * (float)phys_scale;
+                                float mag = std::fabs(p);
+                                float db = (mag > 1e-20f) ? 20.0f * std::log10(mag) : -120.0f;
+                                // Shift so -120 dB is drawn at y=0, loud sounds shoot upward
+                                amps[i] = std::max(0.0f, db + 120.0f);
                             }
+                        } else {
+                            std::fill(amps.begin(), amps.end(), 0.0f);
                         }
                     }
                     
                     if (ImPlot::BeginPlot("Modes", ImVec2(-1, -1))) {
-                        ImPlot::SetupAxes("Frequency (Hz)", "Amplitude (dB)");
-                        ImPlot::SetupAxisLimits(ImAxis_Y1, -120.0, 0.0, ImPlotCond_Once);
+                        ImPlot::SetupAxes("Frequency (Hz)", "Relative Amplitude (dB from floor)");
+                        ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, 140.0, ImPlotCond_Always);
                         ImPlot::PlotBars("Modes", freqs.data(), amps.data(), freqs.size(), 10.0f);
                         ImPlot::EndPlot();
                     }
