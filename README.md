@@ -2,7 +2,7 @@
 
 Real-time interactive drum membrane simulator with GUI, built with SDL2, ImGui, and Eigen.
 
-![Drums C++ GUI](/home/kharazi/.gemini/antigravity/brain/3fbc050d-6e36-4a88-a28e-1efb7cc46304/media__1772131617113.png)
+![Drums C++ GUI](docs/screenshot.png)
 
 ## Overview
 

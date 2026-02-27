@@ -5,7 +5,9 @@ build/
 *.so
 *.dylib
 *.dll
+todo.md
 drums_cpp
+output/
 
 # IDE / Editor
 .cache/
