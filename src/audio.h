@@ -710,11 +710,16 @@ public:
             // Copy staging (coeff[2]) into fade target buffer
             std::memcpy(&engine->coeff[fi], &engine->coeff[2], sizeof(CoeffSet));
             // Initialize shell bank with target default modes
-            engine->shell_bank.count = 4;
-            engine->shell_bank.modes[0] = {2.0f * (float)M_PI * 120.0f, 0.05f, 1.0f, 0.0f, 0.0f};
-            engine->shell_bank.modes[1] = {2.0f * (float)M_PI * 210.0f, 0.04f, 0.8f, 0.0f, 0.0f};
-            engine->shell_bank.modes[2] = {2.0f * (float)M_PI * 340.0f, 0.03f, 0.6f, 0.0f, 0.0f};
-            engine->shell_bank.modes[3] = {2.0f * (float)M_PI * 520.0f, 0.02f, 0.4f, 0.0f, 0.0f};
+            // Initialize shell bank with actual drum modes from the staging buffer
+            engine->shell_bank.count = std::min(4, engine->modes_state.count);
+            for (int k = 0; k < engine->shell_bank.count; ++k) {
+                // Read the actual computed angular frequency from the newly staged CoeffSet
+                float om = engine->coeff[2].omega[k];
+                // Apply a gentle descending gain and fixed shell-like damping
+                float gain = 1.0f - (k * 0.2f); 
+                float damp = 0.05f - (k * 0.01f);
+                engine->shell_bank.modes[k] = {om, damp, gain, 0.0f, 0.0f};
+            }
             engine->update_ready.store(false, std::memory_order_release);
             engine->fading = true;
             engine->fade_alpha = 0.0f;
