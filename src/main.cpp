@@ -580,18 +580,20 @@ int main(int argc, char* argv[]) {
                     }
                     ImGui::Checkbox("Use Multi-Mode Shell Bank", &audio.phys.use_shell_bank);
 
-                    ImGui::Separator();
-                    ImGui::Text("Raw Striker");
-                    float sm_f = (float)audio.phys.striker_mass;
-                    if (ImGui::SliderFloat("Mass (kg)", &sm_f, 0.005f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic)) audio.phys.striker_mass = (double)sm_f;
-                    float sk_f = (float)audio.phys.striker_stiffness;
-                    if (ImGui::SliderFloat("Stiffness (K)", &sk_f, 1e4f, 1e7f, "%.0f", ImGuiSliderFlags_Logarithmic)) audio.phys.striker_stiffness = (double)sk_f;
-                    float sr_f = (float)audio.phys.striker_damping;
-                    if (ImGui::SliderFloat("Contact Damping (R)", &sr_f, 0.1f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) audio.phys.striker_damping = (double)sr_f;
-                    float sp_f = (float)audio.phys.striker_exponent;
-                    if (ImGui::SliderFloat("Exponent (p)", &sp_f, 1.0f, 3.0f, "%.2f")) audio.phys.striker_exponent = (double)sp_f;
-                    float sw_f = (float)audio.strike_width_delta;
-                    if (ImGui::SliderFloat("Mallet Width", &sw_f, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)) audio.strike_width_delta = (double)sw_f;
+                    if (audio.phys.use_contact_model) {
+                        ImGui::Separator();
+                        ImGui::Text("Raw Striker");
+                        float sm_f = (float)audio.phys.striker_mass;
+                        if (ImGui::SliderFloat("Mass (kg)", &sm_f, 0.005f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic)) audio.phys.striker_mass = (double)sm_f;
+                        float sk_f = (float)audio.phys.striker_stiffness;
+                        if (ImGui::SliderFloat("Stiffness (K)", &sk_f, 1e4f, 1e7f, "%.0f", ImGuiSliderFlags_Logarithmic)) audio.phys.striker_stiffness = (double)sk_f;
+                        float sr_f = (float)audio.phys.striker_damping;
+                        if (ImGui::SliderFloat("Contact Damping (R)", &sr_f, 0.1f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) audio.phys.striker_damping = (double)sr_f;
+                        float sp_f = (float)audio.phys.striker_exponent;
+                        if (ImGui::SliderFloat("Exponent (p)", &sp_f, 1.0f, 3.0f, "%.2f")) audio.phys.striker_exponent = (double)sp_f;
+                        float sw_f = (float)audio.strike_width_delta;
+                        if (ImGui::SliderFloat("Mallet Width", &sw_f, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)) audio.strike_width_delta = (double)sw_f;
+                    }
 
                     ImGui::Separator();
                     ImGui::Text("Raw Damping");
@@ -601,19 +603,31 @@ int main(int argc, char* argv[]) {
                     if (ImGui::SliderFloat("Base Freq Damp (a1)", &alpha1_f, 0.0f, 0.05f, "%.5f")) { audio.alpha1 = (double)alpha1_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
                     float beta_f = (float)audio.beta;
                     if (ImGui::SliderFloat("Base Freq Power (beta)", &beta_f, 0.5f, 3.0f, "%.2f")) { audio.beta = (double)beta_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
-                    float air_w_f = (float)audio.phys.air_loss_weight;
-                    if (ImGui::SliderFloat("Air Loss Weight", &air_w_f, 0.0f, 5.0f, "%.2f")) { audio.phys.air_loss_weight = (double)air_w_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
-                    float edge_w_f = (float)audio.phys.edge_loss_weight;
-                    if (ImGui::SliderFloat("Edge Loss Weight", &edge_w_f, 0.0f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) { audio.phys.edge_loss_weight = (double)edge_w_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
+                    
+                    if (audio.phys.use_mode_dependent_damping) {
+                        float air_w_f = (float)audio.phys.air_loss_weight;
+                        if (ImGui::SliderFloat("Air Loss Weight", &air_w_f, 0.0f, 5.0f, "%.2f")) { audio.phys.air_loss_weight = (double)air_w_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
+                        float edge_w_f = (float)audio.phys.edge_loss_weight;
+                        if (ImGui::SliderFloat("Edge Loss Weight", &edge_w_f, 0.0f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) { audio.phys.edge_loss_weight = (double)edge_w_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
+                    }
 
-                    ImGui::Separator();
-                    ImGui::Text("Old Biquad EQ");
-                    float shell_freq_f = (float)audio.shell_freq;
-                    if (ImGui::SliderFloat("Frequency (Hz)", &shell_freq_f, 20.0f, 1000.0f, "%.1f")) { audio.shell_freq = (double)shell_freq_f; audio.compute_filter_coeffs(); }
-                    float shell_q_f = (float)audio.shell_q;
-                    if (ImGui::SliderFloat("Q Factor", &shell_q_f, 0.1f, 20.0f, "%.2f")) { audio.shell_q = (double)shell_q_f; audio.compute_filter_coeffs(); }
-                    float shell_gain_f = (float)audio.shell_gain_db;
-                    if (ImGui::SliderFloat("Gain (dB)", &shell_gain_f, -24.0f, 24.0f, "%.1f")) { audio.shell_gain_db = (double)shell_gain_f; audio.compute_filter_coeffs(); }
+                    if (!audio.phys.use_shell_bank) {
+                        ImGui::Separator();
+                        ImGui::Text("Old Biquad EQ");
+                        float shell_freq_f = (float)audio.shell_freq;
+                        if (ImGui::SliderFloat("Frequency (Hz)", &shell_freq_f, 20.0f, 1000.0f, "%.1f")) { audio.shell_freq = (double)shell_freq_f; audio.compute_filter_coeffs(); }
+                        float shell_q_f = (float)audio.shell_q;
+                        if (ImGui::SliderFloat("Q Factor", &shell_q_f, 0.1f, 20.0f, "%.2f")) { audio.shell_q = (double)shell_q_f; audio.compute_filter_coeffs(); }
+                        float shell_gain_f = (float)audio.shell_gain_db;
+                        if (ImGui::SliderFloat("Gain (dB)", &shell_gain_f, -24.0f, 24.0f, "%.1f")) { audio.shell_gain_db = (double)shell_gain_f; audio.compute_filter_coeffs(); }
+                    } else {
+                        ImGui::Separator();
+                        ImGui::Text("Multi-Mode Shell Bank Active");
+                        float mix_f = (float)audio.phys.shell_mix;
+                        if (ImGui::SliderFloat("Shell Mix", &mix_f, 0.0f, 1.0f, "%.2f")) {
+                            audio.phys.shell_mix = (double)mix_f;
+                        }
+                    }
 
                     ImGui::Separator();
                     ImGui::Text("Listener");
@@ -640,7 +654,6 @@ int main(int argc, char* argv[]) {
 
                 // ── Shared Utilities (always visible at bottom) ──────────
                 ImGui::Separator();
-                ImGui::SliderFloat("Zoom", &zoom, 50.0f, 1000.0f);
 
                 ImGui::Text("Audio Export");
                 ImGui::InputText("WAV Path", export_wav_path, IM_ARRAYSIZE(export_wav_path));
@@ -668,9 +681,47 @@ int main(int argc, char* argv[]) {
                 ImVec2 p0 = ImGui::GetCursorScreenPos();
                 ImVec2 sz = ImGui::GetContentRegionAvail();
                 
-                ImVec2 center = ImVec2(p0.x + sz.x*0.5f, p0.y + sz.y*0.5f);
+                static float pan_x = 0.0f;
+                static float pan_y = 0.0f;
+                
+                if (ImGui::IsWindowHovered()) {
+                    ImGuiIO& io = ImGui::GetIO();
+                    // Panning (Middle or Right mouse button drag)
+                    if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) || ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+                        pan_x += io.MouseDelta.x;
+                        pan_y += io.MouseDelta.y;
+                    }
+                    
+                    // Zooming (Scroll wheel)
+                    if (io.MouseWheel != 0.0f) {
+                        float old_zoom = zoom;
+                        zoom *= (1.0f + io.MouseWheel * 0.15f);
+                        if (zoom < 1.0f) zoom = 1.0f;
+                        if (zoom > 100000.0f) zoom = 100000.0f;
+                        
+                        // Zoom-towards-cursor math
+                        float cx = p0.x + sz.x * 0.5f;
+                        float cy = p0.y + sz.y * 0.5f;
+                        
+                        float world_x = (io.MousePos.x - cx - pan_x) / old_zoom;
+                        float world_y = (io.MousePos.y - cy - pan_y) / old_zoom;
+                        
+                        pan_x = io.MousePos.x - cx - world_x * zoom;
+                        pan_y = io.MousePos.y - cy - world_y * zoom;
+                    }
+                }
+                
+                ImVec2 center = ImVec2(p0.x + sz.x*0.5f + pan_x, p0.y + sz.y*0.5f + pan_y);
                 if (sz.x < 50 || sz.y < 50) {
-                    center = ImVec2(1280/2, 720/2);
+                    center = ImVec2(1280/2 + pan_x, 720/2 + pan_y);
+                }
+                
+                // Reset View button
+                ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - 90, 30));
+                if (ImGui::Button("Reset View")) {
+                    pan_x = 0.0f;
+                    pan_y = 0.0f;
+                    zoom = 120.0f;
                 }
 
                 // ── DRAWING MODE ─────────────────────────────────────────
@@ -946,6 +997,34 @@ int main(int argc, char* argv[]) {
                         ImVec2 delta = ImGui::GetIO().MouseDelta;
                         double dx = delta.x / zoom;
                         double dy = -delta.y / zoom;
+                        
+                        // If dragging the primary mesh, ensure control points and holes follow
+                        if (dragged_mesh_idx == 0) {
+                            if (current_shape == ELLIPSE || current_shape == ANNULUS) {
+                                // Auto-convert parametric primitives to CUSTOM when manually moved, 
+                                // so the handles properly track the shape globally
+                                active_polygon = compute_outer_boundary();
+                                if (!active_polygon.empty()) {
+                                    shape_control_points = active_polygon;
+                                    current_shape = CUSTOM;
+                                }
+                            }
+                            
+                            for (auto& cp : shape_control_points) {
+                                cp.x += dx;
+                                cp.y += dy;
+                            }
+                            for (auto& p : active_polygon) {
+                                p.x += dx;
+                                p.y += dy;
+                            }
+                            for (auto& h : shape_holes) {
+                                h.cx += dx;
+                                h.cy += dy;
+                            }
+                        }
+
+                        // Translate the actual mesh geometry
                         for (auto& v : meshes[dragged_mesh_idx].vertices) {
                             v.x += dx;
                             v.y += dy;

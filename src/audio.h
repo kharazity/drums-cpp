@@ -471,7 +471,7 @@ public:
 
     // ─── Precompute strike coupling arrays ──────────────────────────────────
     // gamma_force[n]: mass-consistent force projection (MU)
-    // psi_contact[n]: mode-shape displacement readout (U)
+    // psi_contact[n]: mode-shape displacement readout (MU)
     void prepare_strike_coupling(
         const Mesh& mesh,
         const ModeData& modes,
@@ -482,10 +482,23 @@ public:
         if (n_modes > MAX_MODES) n_modes = MAX_MODES;
         int J = mesh.vertices.size();
 
-        // --- Build spatial bump F[j] ---
+        // 1. Compute nodal areas recursively (1/3 of adjacent triangle areas)
+        std::vector<double> nodal_area(J, 0.0);
+        for (const auto& tri : mesh.elements) {
+            double x1 = mesh.vertices[tri.v[0]].x, y1 = mesh.vertices[tri.v[0]].y;
+            double x2 = mesh.vertices[tri.v[1]].x, y2 = mesh.vertices[tri.v[1]].y;
+            double x3 = mesh.vertices[tri.v[2]].x, y3 = mesh.vertices[tri.v[2]].y;
+            double area = 0.5 * std::abs(x1*(y2 - y3) + x2*(y3 - y1) + x3*(y1 - y2));
+            double node_weight = area / 3.0;
+            nodal_area[tri.v[0]] += node_weight;
+            nodal_area[tri.v[1]] += node_weight;
+            nodal_area[tri.v[2]] += node_weight;
+        }
+
+        // 2. Build spatial bump shape F[j]
         std::vector<double> F(J, 0.0);
         std::vector<int> active_nodes;
-        double F_sum = 0.0;
+        double F_integral = 0.0;
 
         for (int j = 0; j < J; ++j) {
             double dx = mesh.vertices[j].x - strike_x;
@@ -494,13 +507,13 @@ public:
             if (r < strike_width_delta) {
                 double xi_r = r / strike_width_delta;
                 F[j] = std::exp(-1.0 / (1.0 - xi_r * xi_r));
-                F_sum += F[j];
+                F_integral += F[j] * nodal_area[j];
                 active_nodes.push_back(j);
             }
         }
 
         // Fallback to closest node
-        if (F_sum == 0.0 && J > 0) {
+        if (F_integral == 0.0 && J > 0) {
             double min_r = 1e9;
             int closest = 0;
             for (int j = 0; j < J; ++j) {
@@ -510,24 +523,27 @@ public:
                 if (r < min_r) { min_r = r; closest = j; }
             }
             F[closest] = 1.0;
-            F_sum = 1.0;
+            F_integral = nodal_area[closest];
             active_nodes.push_back(closest);
         }
 
-        // Normalize
-        for (int j : active_nodes) F[j] /= F_sum;
+        // 3. Normalize F to be a proper force density (integral F dA = 1)
+        if (F_integral > 0.0) {
+            for (int j : active_nodes) {
+                F[j] /= F_integral;
+            }
+        }
 
-        // --- Project onto modes ---
-        const Eigen::MatrixXd& U = modes.eigenvectors;
+        // 4. Project onto modes using Galerkin area-weighting (MU)
         for (int n = 0; n < n_modes; ++n) {
             double gamma = 0.0;
-            double psi = 0.0;
             for (int j : active_nodes) {
-                gamma += MU(j, n) * F[j];   // Mass-consistent force projection
-                psi   += U(j, n)  * F[j];   // Mode-shape displacement readout
+                // MU is M * U. So F^T MU computes the discretized integral of F * U dA
+                gamma += MU(j, n) * F[j];   
             }
+            // By Maxwell-Betti reciprocity, displacement readout is perfectly symmetric with force projection
             contact_gamma[n] = (float)gamma;
-            contact_psi[n]   = (float)psi;
+            contact_psi[n]   = (float)gamma;
         }
     }
 
