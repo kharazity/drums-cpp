@@ -608,6 +608,7 @@ int main(int argc, char* argv[]) {
                 } else if (current_tab == TAB_ADVANCED) {
                     // ── Advanced Tab ─────────────────────────────────────────
                     ImGui::Text("Physical Subsystems");
+                    ImGui::Checkbox("Diagnosis Mode (Bypass FX & Master Vol)", &audio.diagnosis_mode);
                     ImGui::Checkbox("Use Contact Striker", &audio.phys.use_contact_model);
                     if (ImGui::Checkbox("Mode-Dependent Damping", &audio.phys.use_mode_dependent_damping)) {
                         if (!all_modes.empty()) audio.build_coefficients(all_modes[0]);

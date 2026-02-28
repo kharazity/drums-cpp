@@ -229,6 +229,7 @@ public:
     ShellResonatorBank shell_bank;  // New Multi-mode Resonator Bank
 
     double peak_envelope = 0.0;     // Auto-gain peak tracker (callback-only)
+    bool diagnosis_mode = false;    // Bypass nonlinear stages and unity gain master volume
 
     // ─── Precomputed Geometry ───────────────────────────────────────────────
     Eigen::MatrixXd MU;             // M·U (J × N_modes), precomputed at mesh rebuild
@@ -886,8 +887,13 @@ public:
             }
 
             // Apply user master volume and soft clip
-            sample *= engine->master_volume;
-            sample = std::tanh(sample);
+            if (engine->diagnosis_mode) {
+                // In diagnosis mode, output pure unaltered samples
+                // No master volume, no soft-clipping
+            } else {
+                sample *= engine->master_volume;
+                sample = std::tanh(sample);
+            }
 
             buffer[i] = (float)sample;
             engine->last_strike_audio.push_back((float)sample);
