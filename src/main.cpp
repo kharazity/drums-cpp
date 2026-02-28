@@ -196,6 +196,39 @@ int main(int argc, char* argv[]) {
         ImGui_ImplSDLRenderer2_Init(renderer);
     }
 
+    // Initialize shell resonance filter
+    audio.compute_filter_coeffs();
+
+    
+    struct BeaterPreset {
+        const char* name;
+        double mass, K_lo, K_hi, R_lo, R_hi, exponent, width;
+    };
+    static const BeaterPreset BEATER_PRESETS[] = {
+        {"Stick",       0.015, 5e5, 2e6, 5.0, 20.0, 2.0, 0.01},
+        {"Hard Mallet", 0.04,  2e5, 1e6, 10.0, 40.0, 1.5, 0.03},
+        {"Soft Mallet", 0.06,  5e4, 3e5, 20.0, 80.0, 1.5, 0.08},
+        {"Finger",      0.02,  1e4, 8e4, 30.0, 100.0, 1.2, 0.15},
+    };
+    int current_beater_idx = 0;
+    float current_beater_hardness = 0.5f;
+
+    struct MicPreset { 
+        const char* name; 
+        double elev, azim; 
+    };
+    static const MicPreset MIC_PRESETS[] = {
+        {"Player",   60.0, 0.0},
+        {"Front",    30.0, 0.0},
+        {"Overhead", 90.0, 0.0},
+        {"Room",     20.0, 45.0},
+        {"Edge",     10.0, 0.0},
+    };
+    int current_mic_idx = 0;
+
+    float current_damping_macro = 0.5f;
+    float current_hit_strength = 5.0f;
+
     bool done = false;
     while (!done) {
         SDL_Event event;
@@ -218,118 +251,60 @@ int main(int argc, char* argv[]) {
             // ═══════════════════════════════════════════════════════════════
             {
                 ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-                ImGui::SetNextWindowSize(ImVec2(300, 350), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(300, 450), ImGuiCond_FirstUseEver);
                 ImGui::Begin("Controls");
                 ImGui::Text("FPS: %.1f", io.Framerate);
                 ImGui::Separator();
+
+                enum UITab { TAB_PLAY, TAB_DESIGN, TAB_ADVANCED };
+                static UITab current_tab = TAB_PLAY;
                 
-                // ── Shape Selection ──────────────────────────────────────
-                const char* shape_names[] = { "Regular Polygon", "Ellipse", "Isospectral Drums", "Custom (Draw)", "Annulus" };
-                int current_shape_idx = (int)current_shape;
-                
-                if (ImGui::Combo("Shape Type", &current_shape_idx, shape_names, IM_ARRAYSIZE(shape_names))) {
-                    current_shape = (ShapeType)current_shape_idx;
-                    shape_holes.clear();  // Clear holes when switching shapes
-                    if (current_shape == CUSTOM) {
-                        app_mode = DRAWING;
-                        draw_points.clear();
-                    } else {
-                        app_mode = PLAY;
-                    }
+                if (ImGui::BeginTabBar("MainTabs")) {
+                    if (ImGui::BeginTabItem("Play")) { current_tab = TAB_PLAY; ImGui::EndTabItem(); }
+                    if (ImGui::BeginTabItem("Design")) { current_tab = TAB_DESIGN; ImGui::EndTabItem(); }
+                    if (ImGui::BeginTabItem("Advanced")) { current_tab = TAB_ADVANCED; ImGui::EndTabItem(); }
+                    ImGui::EndTabBar();
                 }
-                
-                // Shape-specific parameters
-                if (current_shape == ELLIPSE) {
-                    float min_axis = 3.0f / (float)mesh_density;  // Lower bound: 3 mesh units
-                    ImGui::InputFloat("Semi-major (a)", &ellipse_a, 0.01f, 0.1f, "%.3f");
-                    if (ellipse_a < min_axis) ellipse_a = min_axis;
-                    ImGui::InputFloat("Semi-minor (b)", &ellipse_b, 0.01f, 0.1f, "%.3f");
-                    if (ellipse_b < min_axis) ellipse_b = min_axis;
-                    ImGui::TextDisabled("(min: %.4f based on mesh density)", min_axis);
-                } else if (current_shape == REGULAR_POLYGON) {
-                    ImGui::SliderInt("Sides (n)", &polygon_n, 3, 20);
-                    ImGui::SliderFloat("Side Length (L)", &polygon_L, 0.1f, 3.0f);
-                } else if (current_shape == ANNULUS) {
-                    float min_gap = 3.0f / (float)mesh_density;
-                    ImGui::InputFloat("Outer Radius", &annulus_outer_r, 0.01f, 0.1f, "%.3f");
-                    if (annulus_outer_r < 2.0f * min_gap) annulus_outer_r = 2.0f * min_gap;
-                    ImGui::InputFloat("Inner Radius", &annulus_inner_r, 0.01f, 0.1f, "%.3f");
-                    if (annulus_inner_r < min_gap) annulus_inner_r = min_gap;
-                    if (annulus_inner_r >= annulus_outer_r - min_gap)
-                        annulus_inner_r = annulus_outer_r - min_gap;
-                    ImGui::TextDisabled("(gap min: %.4f)", min_gap);
-                }
+                ImGui::Separator();
 
-                // Parameters requiring Rebuild
-                if (ImGui::InputInt("Modes", &n_modes, 1, 10)) {
-                    if (n_modes < 1) n_modes = 1;
-                }
-                ImGui::InputInt("Mesh Density", &mesh_density);
-                if (mesh_density < 5) mesh_density = 5;
-                if (mesh_density > 1000000) mesh_density = 1000000;
-
-                if (app_mode == PLAY || app_mode == PLACING_HOLE) {
-                    // ── Holes UI ─────────────────────────────────────────
-                    if (current_shape != ISOSPECTRAL && current_shape != ANNULUS) {
-                        ImGui::Separator();
-                        bool holes_open = ImGui::TreeNodeEx("Holes", ImGuiTreeNodeFlags_DefaultOpen,
-                                                            "Holes  (%d placed)", (int)shape_holes.size());
-                        if (holes_open) {
-                            ImGui::Indent(4.0f);
-                            
-                            bool hole_size_changed = false;
-                            float min_gap = std::max(0.01f, 3.0f / (float)mesh_density);
-                            hole_size_changed |= ImGui::InputFloat("a (semi-major)", &new_hole_a, 0.01f, 0.05f, "%.3f");
-                            if (new_hole_a < min_gap) new_hole_a = min_gap;
-                            hole_size_changed |= ImGui::InputFloat("b (semi-minor)", &new_hole_b, 0.01f, 0.05f, "%.3f");
-                            if (new_hole_b < min_gap) new_hole_b = min_gap;
-
-                            // Live-update all existing holes when a/b change
-                            if (hole_size_changed && !shape_holes.empty()) {
-                                for (auto& h : shape_holes) {
-                                    h.a = new_hole_a;
-                                    h.b = new_hole_b;
-                                }
-                                meshes.assign(1, Mesh());
-                                auto hole_polys = holes_to_polygons();
-                                auto outer = compute_outer_boundary();
-                                if (!outer.empty()) {
-                                    meshes[0].generate_from_polygon(outer, hole_polys, mesh_density);
-                                }
-                                fems.clear();
-                                all_modes.clear();
-                                if (meshes[0].elements.size() > 0) {
-                                    FEM f;
-                                    f.assemble(meshes[0]);
-                                    fems.push_back(f);
-                                    all_modes.push_back(Solver::solve(f, n_modes));
-                                    audio.precompute_MU(fems[0], all_modes[0]);
-                                    audio.compute_xi(meshes[0]);
-                                    audio.compute_radiation_weights(all_modes[0]);
-                                }
-                            }
-
-                            ImGui::Spacing();
-                            if (app_mode == PLACING_HOLE) {
-                                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "[+] Click canvas to place hole");
-                                if (ImGui::Button("Cancel")) app_mode = PLAY;
-                            } else {
-                                if (ImGui::Button("Add Hole")) app_mode = PLACING_HOLE;
-                                if (!shape_holes.empty()) {
-                                    ImGui::SameLine();
-                                    if (ImGui::Button("Clear All")) shape_holes.clear();
-                                }
-                            }
-                            ImGui::Unindent(4.0f);
-                            ImGui::TreePop();
+                // ── Shape Selection (Shared across Play & Design) ────────
+                if (current_tab == TAB_PLAY || current_tab == TAB_DESIGN) {
+                    const char* shape_names[] = { "Regular Polygon", "Ellipse", "Isospectral Drums", "Custom (Draw)", "Annulus" };
+                    int current_shape_idx = (int)current_shape;
+                    
+                    if (ImGui::Combo("Shape Type", &current_shape_idx, shape_names, IM_ARRAYSIZE(shape_names))) {
+                        current_shape = (ShapeType)current_shape_idx;
+                        shape_holes.clear();
+                        if (current_shape == CUSTOM) {
+                            app_mode = DRAWING;
+                            draw_points.clear();
+                        } else {
+                            app_mode = PLAY;
                         }
                     }
+                    
+                    if (current_shape == ELLIPSE) {
+                        float min_axis = 3.0f / (float)mesh_density;
+                        ImGui::InputFloat("Semi-major (a)", &ellipse_a, 0.01f, 0.1f, "%.3f");
+                        if (ellipse_a < min_axis) ellipse_a = min_axis;
+                        ImGui::InputFloat("Semi-minor (b)", &ellipse_b, 0.01f, 0.1f, "%.3f");
+                        if (ellipse_b < min_axis) ellipse_b = min_axis;
+                        ImGui::TextDisabled("(min: %.4f based on density)", min_axis);
+                    } else if (current_shape == REGULAR_POLYGON) {
+                        ImGui::SliderInt("Sides (n)", &polygon_n, 3, 20);
+                        ImGui::SliderFloat("Side Length (L)", &polygon_L, 0.1f, 3.0f);
+                    } else if (current_shape == ANNULUS) {
+                        float min_gap = 3.0f / (float)mesh_density;
+                        ImGui::InputFloat("Outer Radius", &annulus_outer_r, 0.01f, 0.1f, "%.3f");
+                        if (annulus_outer_r < 2.0f * min_gap) annulus_outer_r = 2.0f * min_gap;
+                        ImGui::InputFloat("Inner Radius", &annulus_inner_r, 0.01f, 0.1f, "%.3f");
+                        if (annulus_inner_r < min_gap) annulus_inner_r = min_gap;
+                        if (annulus_inner_r >= annulus_outer_r - min_gap) annulus_inner_r = annulus_outer_r - min_gap;
+                        ImGui::TextDisabled("(gap min: %.4f)", min_gap);
+                    }
 
                     ImGui::Spacing();
-                    ImGui::Spacing();
-                    ImGui::Separator();
-
-                    if (ImGui::Button("Rebuild Mesh")) {
+                    if (ImGui::Button("Rebuild Geometry", ImVec2(-1, 0))) {
                         if (current_shape == ISOSPECTRAL) {
                             meshes = Mesh::generate_isospectral(mesh_density);
                             shape_control_points.clear();
@@ -394,57 +369,27 @@ int main(int argc, char* argv[]) {
                             memset(audio.modes_state.active, 0, sizeof(audio.modes_state.active));
                         }
                     }
-                } else {
-                    // Drawing mode controls
-                    ImGui::TextColored(ImVec4(1, 0.8f, 0, 1), "DRAWING MODE");
-                    ImGui::Text("Left-click to add points");
-                    ImGui::Text("Points: %d", (int)draw_points.size());
+                    
 
-                    if (draw_points.size() >= 3) {
-                        if (ImGui::Button("Finish & Build")) {
-                            // Close polygon and mesh it
-                            active_polygon = draw_points;
-                            meshes.assign(1, Mesh());
-                            meshes[0].generate_from_polygon(active_polygon, {}, mesh_density);
-                            
-                            fems.clear();
-                            all_modes.clear();
-                            if (meshes[0].elements.size() > 0) {
-                                FEM f;
-                                f.assemble(meshes[0]);
-                                fems.push_back(f);
-                                all_modes.push_back(Solver::solve(f, n_modes));
-
-                                audio.precompute_MU(fems[0], all_modes[0]);
-                                audio.compute_xi(meshes[0]);
-                                audio.compute_radiation_weights(all_modes[0]);
-
-                                freqs.clear();
-                                {
-                                    std::lock_guard<std::mutex> lock(audio.mutex);
-                                    audio.modes_state.count = 0;
-                                    memset(audio.modes_state.active, 0, sizeof(audio.modes_state.active));
-                                }
-                            }
-                            shape_control_points = active_polygon;  // Custom polygon control points
-                            app_mode = PLAY;
-                            draw_points.clear();
-                        }
-                        ImGui::SameLine();
-                    }
-                    if (ImGui::Button("Cancel")) {
-                        app_mode = PLAY;
-                        current_shape = REGULAR_POLYGON; // fallback out of custom mode
-                        draw_points.clear();
-                    }
                 }
 
-                ImGui::Separator();
-                
-                if (app_mode == PLAY) {
-                    if (ImGui::Button("Strike Center")) {
+                if (current_tab == TAB_PLAY) {
+                    // ── Play Tab ─────────────────────────────────────────────
+                    float tension_f = (float)audio.tension;
+                    if (ImGui::InputFloat("Tension", &tension_f, 1.0f, 10.0f, "%.1f")) {
+                        if (tension_f <= 0.0f) {
+                            tension_f = 0.1f;
+                        }
+                        audio.tension = (double)tension_f;
+                        // Debounced radiation weight recompute on tension change
+                        if (!all_modes.empty()) {
+                            audio.compute_radiation_weights(all_modes[0]);
+                        }
+                    }
+
+                    ImGui::Spacing();
+                    if (ImGui::Button("Strike Center", ImVec2(-1, 0))) {
                         if (!meshes.empty() && !meshes[0].vertices.empty() && !all_modes.empty()) {
-                            // Strike at mesh centroid
                             double cx = 0, cy = 0;
                             for (const auto& v : meshes[0].vertices) { cx += v.x; cy += v.y; }
                             cx /= meshes[0].vertices.size();
@@ -452,71 +397,251 @@ int main(int argc, char* argv[]) {
                             audio.trigger_strike(meshes[0], all_modes[0], cx, cy, 1.0);
                         }
                     }
-                }
-                
-                // ── Physical Parameters ──────────────────────────────────
-                static float alpha0_f = (float)audio.alpha0;
-                if (ImGui::SliderFloat("Damping (a0)", &alpha0_f, 0.1f, 50.0f, "%.1f")) {
-                    audio.alpha0 = (double)alpha0_f;
-                    if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
-                }
-                static float alpha1_f = (float)audio.alpha1;
-                if (ImGui::SliderFloat("Freq Damping (a1)", &alpha1_f, 0.0f, 0.05f, "%.5f")) {
-                    audio.alpha1 = (double)alpha1_f;
-                    if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
-                }
-                static float tension_f = (float)audio.tension;
-                if (ImGui::InputFloat("Tension", &tension_f, 1.0f, 10.0f, "%.1f")) {
-                    if (tension_f <= 0.0f) {
-                        tension_f = 0.1f;
+
+                    ImGui::Separator();
+                    ImGui::Text("Performance");
+                    if (ImGui::SliderFloat("Hit Strength", &current_hit_strength, 0.1f, 10.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) {
+                        audio.strike_v0 = (double)current_hit_strength;
+                        audio.phys.striker_initial_velocity = (double)current_hit_strength;
                     }
-                    audio.tension = (double)tension_f;
-                    // Debounced radiation weight recompute on tension change
-                    if (!all_modes.empty()) {
-                        audio.compute_radiation_weights(all_modes[0]);
+                    
+                    const char* beater_names[] = { "Stick", "Hard Mallet", "Soft Mallet", "Finger" };
+                    bool beater_changed = ImGui::Combo("Beater Type", &current_beater_idx, beater_names, IM_ARRAYSIZE(beater_names));
+                    bool hardness_changed = ImGui::SliderFloat("Beater Hardness", &current_beater_hardness, 0.0f, 1.0f);
+                    
+                    if (beater_changed || hardness_changed) {
+                        const auto& b = BEATER_PRESETS[current_beater_idx];
+                        audio.phys.striker_mass = b.mass;
+                        audio.phys.striker_stiffness = b.K_lo + current_beater_hardness * (b.K_hi - b.K_lo);
+                        audio.phys.striker_damping = b.R_lo + current_beater_hardness * (b.R_hi - b.R_lo);
+                        audio.phys.striker_exponent = b.exponent;
+                        audio.strike_width_delta = b.width;
                     }
+                    
+                    bool damping_changed = ImGui::SliderFloat("Damping / Muffling", &current_damping_macro, 0.0f, 1.0f);
+                    if (damping_changed) {
+                        audio.alpha0 = 0.5 + current_damping_macro * 19.5;
+                        audio.phys.air_loss_weight = 0.5 + current_damping_macro * 2.5;
+                        audio.phys.edge_loss_weight = 0.0 + current_damping_macro * 50.0;
+                        if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
+                    }
+
+                    float mix_f = (float)audio.phys.shell_mix;
+                    if (ImGui::SliderFloat("Body", &mix_f, 0.0f, 1.0f, "%.2f")) {
+                        audio.phys.shell_mix = (double)mix_f;
+                    }
+
+                    ImGui::Separator();
+                    ImGui::Text("Environment");
+
+                    const char* mic_names[] = { "Player", "Front", "Overhead", "Room", "Edge" };
+                    if (ImGui::Combo("Mic Preset", &current_mic_idx, mic_names, IM_ARRAYSIZE(mic_names))) {
+                        const auto& m = MIC_PRESETS[current_mic_idx];
+                        audio.listener_elevation = m.elev;
+                        audio.listener_azimuth = m.azim;
+                        if (!meshes.empty()) audio.compute_xi(meshes[0]);
+                        if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
+                    }
+
+                    float vol_f = (float)audio.master_volume;
+                    if (ImGui::SliderFloat("Master Volume", &vol_f, 0.01f, 100.0f, "%.2f", ImGuiSliderFlags_Logarithmic)) {
+                        audio.master_volume = (double)vol_f;
+                    }
+                } else if (current_tab == TAB_DESIGN) {
+                    // ── Design Tab ─────────────────────────────────────────────
+                    if (ImGui::InputInt("Modes", &n_modes, 1, 10)) {
+                        if (n_modes < 1) n_modes = 1;
+                    }
+                    if (ImGui::InputInt("Mesh Density", &mesh_density)) {
+                        if (mesh_density < 5) mesh_density = 5;
+                        if (mesh_density > 1000000) mesh_density = 1000000;
+                    }
+
+                    if (app_mode == PLAY || app_mode == PLACING_HOLE) {
+                        // ── Holes UI ─────────────────────────────────────────
+                        if (current_shape != ISOSPECTRAL && current_shape != ANNULUS) {
+                            ImGui::Separator();
+                            bool holes_open = ImGui::TreeNodeEx("Holes", ImGuiTreeNodeFlags_DefaultOpen,
+                                                                "Holes  (%d placed)", (int)shape_holes.size());
+                            if (holes_open) {
+                                ImGui::Indent(4.0f);
+                                
+                                bool hole_size_changed = false;
+                                float min_gap = std::max(0.01f, 3.0f / (float)mesh_density);
+                                hole_size_changed |= ImGui::InputFloat("a (semi-major)", &new_hole_a, 0.01f, 0.05f, "%.3f");
+                                if (new_hole_a < min_gap) new_hole_a = min_gap;
+                                hole_size_changed |= ImGui::InputFloat("b (semi-minor)", &new_hole_b, 0.01f, 0.05f, "%.3f");
+                                if (new_hole_b < min_gap) new_hole_b = min_gap;
+
+                                // Live-update all existing holes when a/b change
+                                if (hole_size_changed && !shape_holes.empty()) {
+                                    for (auto& h : shape_holes) {
+                                        h.a = new_hole_a;
+                                        h.b = new_hole_b;
+                                    }
+                                    meshes.assign(1, Mesh());
+                                    auto hole_polys = holes_to_polygons();
+                                    auto outer = compute_outer_boundary();
+                                    if (!outer.empty()) {
+                                        meshes[0].generate_from_polygon(outer, hole_polys, mesh_density);
+                                    }
+                                    fems.clear();
+                                    all_modes.clear();
+                                    if (meshes[0].elements.size() > 0) {
+                                        FEM f;
+                                        f.assemble(meshes[0]);
+                                        fems.push_back(f);
+                                        all_modes.push_back(Solver::solve(f, n_modes));
+                                        audio.precompute_MU(fems[0], all_modes[0]);
+                                        audio.compute_xi(meshes[0]);
+                                        audio.compute_radiation_weights(all_modes[0]);
+                                    }
+                                }
+
+                                ImGui::Spacing();
+                                if (app_mode == PLACING_HOLE) {
+                                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "[+] Click canvas to place hole");
+                                    if (ImGui::Button("Cancel")) app_mode = PLAY;
+                                } else {
+                                    if (ImGui::Button("Add Hole")) app_mode = PLACING_HOLE;
+                                    if (!shape_holes.empty()) {
+                                        ImGui::SameLine();
+                                        if (ImGui::Button("Clear All")) shape_holes.clear();
+                                    }
+                                }
+                                ImGui::Unindent(4.0f);
+                                ImGui::TreePop();
+                            }
+                        }
+
+                        ImGui::Spacing();
+                        ImGui::Separator();
+
+                        ImGui::Spacing();
+                        if (ImGui::Button("Strike Center", ImVec2(-1, 0))) {
+                            if (!meshes.empty() && !meshes[0].vertices.empty() && !all_modes.empty()) {
+                                double cx = 0, cy = 0;
+                                for (const auto& v : meshes[0].vertices) { cx += v.x; cy += v.y; }
+                                cx /= meshes[0].vertices.size();
+                                cy /= meshes[0].vertices.size();
+                                audio.trigger_strike(meshes[0], all_modes[0], cx, cy, 1.0);
+                            }
+                        }
+                    } else {
+                        // Drawing mode controls
+                        ImGui::TextColored(ImVec4(1, 0.8f, 0, 1), "DRAWING MODE");
+                        ImGui::Text("Left-click to add points");
+                        ImGui::Text("Points: %d", (int)draw_points.size());
+
+                        if (draw_points.size() >= 3) {
+                            if (ImGui::Button("Finish & Build")) {
+                                // Close polygon and mesh it
+                                active_polygon = draw_points;
+                                meshes.assign(1, Mesh());
+                                meshes[0].generate_from_polygon(active_polygon, {}, mesh_density);
+                                
+                                fems.clear();
+                                all_modes.clear();
+                                if (meshes[0].elements.size() > 0) {
+                                    FEM f;
+                                    f.assemble(meshes[0]);
+                                    fems.push_back(f);
+                                    all_modes.push_back(Solver::solve(f, n_modes));
+
+                                    audio.precompute_MU(fems[0], all_modes[0]);
+                                    audio.compute_xi(meshes[0]);
+                                    audio.compute_radiation_weights(all_modes[0]);
+
+                                    freqs.clear();
+                                    {
+                                        std::lock_guard<std::mutex> lock(audio.mutex);
+                                        audio.modes_state.count = 0;
+                                        memset(audio.modes_state.active, 0, sizeof(audio.modes_state.active));
+                                    }
+                                }
+                                shape_control_points = active_polygon;  // Custom polygon control points
+                                app_mode = PLAY;
+                                draw_points.clear();
+                            }
+                            ImGui::SameLine();
+                        }
+                        if (ImGui::Button("Cancel")) {
+                            app_mode = PLAY;
+                            current_shape = REGULAR_POLYGON; // fallback out of custom mode
+                            draw_points.clear();
+                        }
+                    }
+                } else if (current_tab == TAB_ADVANCED) {
+                    // ── Advanced Tab ─────────────────────────────────────────
+                    ImGui::Text("Physical Subsystems");
+                    ImGui::Checkbox("Use Contact Striker", &audio.phys.use_contact_model);
+                    if (ImGui::Checkbox("Mode-Dependent Damping", &audio.phys.use_mode_dependent_damping)) {
+                        if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
+                    }
+                    ImGui::Checkbox("Use Multi-Mode Shell Bank", &audio.phys.use_shell_bank);
+
+                    ImGui::Separator();
+                    ImGui::Text("Raw Striker");
+                    float sm_f = (float)audio.phys.striker_mass;
+                    if (ImGui::SliderFloat("Mass (kg)", &sm_f, 0.005f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic)) audio.phys.striker_mass = (double)sm_f;
+                    float sk_f = (float)audio.phys.striker_stiffness;
+                    if (ImGui::SliderFloat("Stiffness (K)", &sk_f, 1e4f, 1e7f, "%.0f", ImGuiSliderFlags_Logarithmic)) audio.phys.striker_stiffness = (double)sk_f;
+                    float sr_f = (float)audio.phys.striker_damping;
+                    if (ImGui::SliderFloat("Contact Damping (R)", &sr_f, 0.1f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) audio.phys.striker_damping = (double)sr_f;
+                    float sp_f = (float)audio.phys.striker_exponent;
+                    if (ImGui::SliderFloat("Exponent (p)", &sp_f, 1.0f, 3.0f, "%.2f")) audio.phys.striker_exponent = (double)sp_f;
+                    float sw_f = (float)audio.strike_width_delta;
+                    if (ImGui::SliderFloat("Mallet Width", &sw_f, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)) audio.strike_width_delta = (double)sw_f;
+
+                    ImGui::Separator();
+                    ImGui::Text("Raw Damping");
+                    float alpha0_f = (float)audio.alpha0;
+                    if (ImGui::SliderFloat("Base Damping (a0)", &alpha0_f, 0.1f, 50.0f, "%.1f")) { audio.alpha0 = (double)alpha0_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
+                    float alpha1_f = (float)audio.alpha1;
+                    if (ImGui::SliderFloat("Base Freq Damp (a1)", &alpha1_f, 0.0f, 0.05f, "%.5f")) { audio.alpha1 = (double)alpha1_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
+                    float beta_f = (float)audio.beta;
+                    if (ImGui::SliderFloat("Base Freq Power (beta)", &beta_f, 0.5f, 3.0f, "%.2f")) { audio.beta = (double)beta_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
+                    float air_w_f = (float)audio.phys.air_loss_weight;
+                    if (ImGui::SliderFloat("Air Loss Weight", &air_w_f, 0.0f, 5.0f, "%.2f")) { audio.phys.air_loss_weight = (double)air_w_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
+                    float edge_w_f = (float)audio.phys.edge_loss_weight;
+                    if (ImGui::SliderFloat("Edge Loss Weight", &edge_w_f, 0.0f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) { audio.phys.edge_loss_weight = (double)edge_w_f; if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]); }
+
+                    ImGui::Separator();
+                    ImGui::Text("Old Biquad EQ");
+                    float shell_freq_f = (float)audio.shell_freq;
+                    if (ImGui::SliderFloat("Frequency (Hz)", &shell_freq_f, 20.0f, 1000.0f, "%.1f")) { audio.shell_freq = (double)shell_freq_f; audio.compute_filter_coeffs(); }
+                    float shell_q_f = (float)audio.shell_q;
+                    if (ImGui::SliderFloat("Q Factor", &shell_q_f, 0.1f, 20.0f, "%.2f")) { audio.shell_q = (double)shell_q_f; audio.compute_filter_coeffs(); }
+                    float shell_gain_f = (float)audio.shell_gain_db;
+                    if (ImGui::SliderFloat("Gain (dB)", &shell_gain_f, -24.0f, 24.0f, "%.1f")) { audio.shell_gain_db = (double)shell_gain_f; audio.compute_filter_coeffs(); }
+
+                    ImGui::Separator();
+                    ImGui::Text("Listener");
+                    float elevation_f = (float)audio.listener_elevation;
+                    if (ImGui::SliderFloat("Elevation (deg)", &elevation_f, 0.0f, 90.0f, "%.1f")) {
+                        audio.listener_elevation = (double)elevation_f;
+                        if (!meshes.empty()) audio.compute_xi(meshes[0]);
+                        if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
+                    }
+                    float azimuth_f = (float)audio.listener_azimuth;
+                    if (ImGui::SliderFloat("Azimuth (deg)", &azimuth_f, 0.0f, 360.0f, "%.1f")) {
+                        audio.listener_azimuth = (double)azimuth_f;
+                        if (!meshes.empty()) audio.compute_xi(meshes[0]);
+                        if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
+                    }
+
+                    ImGui::Separator();
+                    ImGui::Text("Metrics");
+                    ImGui::Text("Wave Speed (c) = %.1f m/s", audio.wave_speed());
+                    int total_verts = 0;
+                    for (const auto& m : meshes) total_verts += m.vertices.size();
+                    ImGui::Text("Meshes: %lu  Total Vertices: %d", meshes.size(), total_verts);
                 }
-                
-                static float v0_f = (float)audio.strike_v0;
-                if (ImGui::SliderFloat("Strike Velocity (v0)", &v0_f, 0.1f, 10.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) {
-                    audio.strike_v0 = (double)v0_f;
-                }
-                
-                static float delta_f = (float)audio.strike_width_delta;
-                if (ImGui::SliderFloat("Mallet Width", &delta_f, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)) {
-                    audio.strike_width_delta = (double)delta_f;
-                }
-                
-                static float vol_f = (float)audio.master_volume;
-                if (ImGui::SliderFloat("Master Volume", &vol_f, 0.01f, 100.0f, "%.2f", ImGuiSliderFlags_Logarithmic)) {
-                    audio.master_volume = (double)vol_f;
-                }
-                
+
+                // ── Shared Utilities (always visible at bottom) ──────────
+                ImGui::Separator();
                 ImGui::SliderFloat("Zoom", &zoom, 50.0f, 1000.0f);
 
-                ImGui::Separator();
-                ImGui::Text("Listener Direction");
-                static float elevation_f = (float)audio.listener_elevation;
-                if (ImGui::SliderFloat("Elevation (deg)", &elevation_f, 0.0f, 90.0f, "%.1f")) {
-                    audio.listener_elevation = (double)elevation_f;
-                    if (!meshes.empty()) audio.compute_xi(meshes[0]);
-                    if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
-                }
-                static float azimuth_f = (float)audio.listener_azimuth;
-                if (ImGui::SliderFloat("Azimuth (deg)", &azimuth_f, 0.0f, 360.0f, "%.1f")) {
-                    audio.listener_azimuth = (double)azimuth_f;
-                    if (!meshes.empty()) audio.compute_xi(meshes[0]);
-                    if (!all_modes.empty()) audio.compute_radiation_weights(all_modes[0]);
-                }
-
-                ImGui::Separator();
-                ImGui::Text("c = %.1f m/s", audio.wave_speed());
-                
-                int total_verts = 0;
-                for (const auto& m : meshes) total_verts += m.vertices.size();
-                ImGui::Text("Meshes: %lu  Total Vertices: %d", meshes.size(), total_verts);
-
-                ImGui::Separator();
                 ImGui::Text("Audio Export");
                 ImGui::InputText("WAV Path", export_wav_path, IM_ARRAYSIZE(export_wav_path));
                 if (ImGui::Button("Export to .wav")) {
@@ -532,7 +657,6 @@ int main(int argc, char* argv[]) {
 
                 ImGui::End();
             }
-            
             // ═══════════════════════════════════════════════════════════════
             // 2. Drum View (Mesh Rendering & Interaction)
             // ═══════════════════════════════════════════════════════════════
@@ -970,7 +1094,7 @@ int main(int argc, char* argv[]) {
                     if (ImPlot::BeginPlot("Modes", ImVec2(-1, -1))) {
                         ImPlot::SetupAxes("Frequency (Hz)", "Relative Amplitude (dB from floor)");
                         ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, 140.0, ImPlotCond_Always);
-                        ImPlot::PlotBars("Modes", freqs.data(), amps.data(), freqs.size(), 10.0f);
+                        ImPlot::PlotBars("Modes", freqs.data(), amps.data(), freqs.size(), 1.0f);
                         ImPlot::EndPlot();
                     }
                 }

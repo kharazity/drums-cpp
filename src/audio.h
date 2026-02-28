@@ -87,6 +87,8 @@ struct CoeffSet {
     float G_im[MAX_MODES]   = {};   // Forcing coefficient imag
     float sB_re[MAX_MODES]  = {};   // Forcing correction s·B real
     float sB_im[MAX_MODES]  = {};   // Forcing correction s·B imag
+    float s_re[MAX_MODES]   = {};   // s_n real part: -d_n
+    float s_im[MAX_MODES]   = {};   // s_n imag part: ω_n
 };
 
 // ─── Modal State (phasor Z, activity flags) ─────────────────────────────────
@@ -98,6 +100,96 @@ struct ModalState {
     int count = 0;
 };
 
+// ─── Biquad Filter State ────────────────────────────────────────────────────
+struct BiquadCoeffs {
+    float b0 = 1.0f;
+    float b1 = 0.0f;
+    float b2 = 0.0f;
+    float a1 = 0.0f;
+    float a2 = 0.0f;
+};
+
+struct BiquadState {
+    float x1 = 0.0f;
+    float x2 = 0.0f;
+    float y1 = 0.0f;
+    float y2 = 0.0f;
+    
+    float process(float in, const BiquadCoeffs& c) {
+        float out = c.b0 * in + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+        x2 = x1;
+        x1 = in;
+        y2 = y1;
+        y1 = out;
+        return out;
+    }
+};
+
+// ─── Physical Model Parameters (toggle flags + striker constants) ────────────
+struct PhysicalModelParams {
+    bool use_contact_model = false;
+    bool use_mode_dependent_damping = false;
+    bool use_shell_bank = false;
+
+    // Striker / contact
+    double striker_mass = 0.02;          // kg
+    double striker_stiffness = 5e5;      // K
+    double striker_damping = 10.0;       // R (contact damping)
+    double striker_exponent = 1.5;       // p (Hertz power-law exponent)
+    double striker_initial_velocity = 1.0; // m/s
+
+    // Damping (Milestone 2)
+    double edge_loss_weight = 0.0;
+    double air_loss_weight = 1.0;
+
+    // Shell Bank (Milestone 3)
+    int shell_mode_count = 4;
+    double shell_mix = 0.2;
+};
+
+// ─── Striker State (single degree of freedom, updated per sample) ────────────
+struct StrikerState {
+    bool active = false;
+    double y = 0.0;   // striker position (positive = into membrane)
+    double v = 0.0;   // striker velocity
+};
+
+// ─── Shell Resonator Bank (Milestone 3) ─────────────────────────────────────
+struct ShellMode {
+    float omega = 0.0f;
+    float damping = 0.0f;
+    float gain = 1.0f;
+
+    float x = 0.0f;   // state (displacement)
+    float v = 0.0f;   // state (velocity)
+};
+
+struct ShellResonatorBank {
+    static constexpr int MAX_SHELL_MODES = 8;
+    ShellMode modes[MAX_SHELL_MODES];
+    int count = 0;
+
+    void reset() {
+        for (int i = 0; i < MAX_SHELL_MODES; ++i) {
+            modes[i].x = 0.0f;
+            modes[i].v = 0.0f;
+        }
+    }
+
+    float process(float drive, float dt) {
+        float out = 0.0f;
+        for (int i = 0; i < count; ++i) {
+            ShellMode& m = modes[i];
+            // Symplectic Euler
+            float force = drive - (m.omega * m.omega * m.x) - (2.0f * m.damping * m.omega * m.v);
+            m.v += dt * force;
+            m.x += dt * m.v;
+            out += m.gain * m.x;
+        }
+        return out;
+    }
+};
+
 class AudioEngine {
 public:
     std::mutex mutex;               // Only for strike/WAV export (not hot path coefficients)
@@ -107,9 +199,16 @@ public:
     double tension   = 200.0;       // T (N/m)
     double rho_s     = 0.26;        // Surface density (kg/m²)
     double alpha0    = 5.0;         // Frequency-independent damping (1/s)
-    double alpha1    = 0.01;        // Frequency-proportional damping (s)
+    double alpha1    = 0.01;        // Frequency-proportional damping coefficient
+    double beta      = 1.0;         // Frequency damping power law exponent
     double strike_v0 = 1.0;         // Strike velocity (m/s)
     double strike_width_delta = 0.05; // Spatial mallet strike width (m)
+
+    // ─── Physical Model Params & Striker ────────────────────────────────────
+    PhysicalModelParams phys;
+    StrikerState striker;
+    float contact_gamma[MAX_MODES] = {};  // Force injection weights (MU-based)
+    float contact_psi[MAX_MODES]   = {};  // Displacement readout weights (U-based)
 
     // ─── Far-Field Radiation Parameters ─────────────────────────────────────
     double c_air = 343.0;           // Speed of sound in air (m/s)
@@ -118,12 +217,25 @@ public:
     double listener_elevation = 90.0; // Degrees (90° = directly overhead)
     double listener_azimuth   = 0.0;  // Degrees
     double master_volume = 10.0;    // User-adjustable master volume
+    
+    // ─── Shell Resonance Filter Parameters ──────────────────────────────────
+    double shell_freq = 200.0;      // Resonance Frequency (Hz) (Old Biquad)
+    double shell_q = 5.0;           // Q Factor
+    double shell_gain_db = 0.0;     // Gain (dB)
+    ShellResonatorBank shell_bank;  // New Multi-mode Resonator Bank
+
     double peak_envelope = 0.0;     // Auto-gain peak tracker (callback-only)
 
     // ─── Precomputed Geometry ───────────────────────────────────────────────
     Eigen::MatrixXd MU;             // M·U (J × N_modes), precomputed at mesh rebuild
+    const Eigen::MatrixXd* U_ptr = nullptr; // Pointer to eigenvectors (NOT owned)
     std::vector<double> xi;         // Phase-centered ξ_j = n_∥·s_j - mean(ξ)
     int n_modes_cached = 0;
+
+    // ─── Mode-Dependent Damping Data (Milestone 2) ──────────────────────────
+    std::vector<int> boundary_nodes;
+    float modal_edge_participation[MAX_MODES] = {};
+    float modal_air_participation[MAX_MODES] = {};
 
     // ─── Three-Buffer Coefficients (lock-free, fixed staging) ────────────────
     // coeff[0], coeff[1] = live buffers rotated between cur/fade by callback
@@ -134,9 +246,18 @@ public:
     // No staging_idx: staging is always coeff[2]
     std::atomic<bool> update_ready{false};  // Mailbox flag: UI sets, callback clears
 
+    BiquadCoeffs filter_coeff[3];
+    std::atomic<int> cur_filter_idx{0};
+    std::atomic<int> fade_filter_idx{1};
+    std::atomic<bool> filter_update_ready{false};
+    BiquadState cur_filter_state;
+    BiquadState fade_filter_state;
+
     // ─── Crossfade State (only touched by callback) ─────────────────────────
     bool fading = false;
     float fade_alpha = 0.0f;
+    bool fading_filter = false;
+    float fade_filter_alpha = 0.0f;
     static constexpr float FADE_DURATION_S = 0.02f; // 20ms crossfade
 
     // ─── Modal State (shared, protected by mutex for strike init) ───────────
@@ -164,6 +285,7 @@ public:
         int n_modes = modes.eigenvalues.size();
         int J = modes.eigenvectors.rows();
         n_modes_cached = n_modes;
+        U_ptr = &modes.eigenvectors;  // Store pointer for contact readout later
 
         // Single sparse×dense multiply: MU = M * U
         MU = fem.M * modes.eigenvectors;  // (J × N_modes)
@@ -236,11 +358,21 @@ public:
                 continue;
             }
 
+            // Compute radiative participation (I_vol)
+            double I_vol = 0.0;
+            for (int j = 0; j < J; ++j) {
+                I_vol += MU(j, n);
+            }
+            modal_air_participation[n] = (float)I_vol;
+
             // Damping (clamped to underdamped regime)
-            double d_n = alpha0 + alpha1 * freq_hz;
+            double d_n = build_mode_damping(n, omega_n, freq_hz);
             d_n = std::min(d_n, 0.95 * omega_n);
 
             // s_n = -d_n + i·ω_n
+            stg.s_re[n] = (float)(-d_n);
+            stg.s_im[n] = (float)(omega_n);
+
             // s_n² = (d_n² - ω_n²) + i·(-2·d_n·ω_n)
             stg.s2_re[n] = (float)(d_n * d_n - omega_n * omega_n);
             stg.s2_im[n] = (float)(-2.0 * d_n * omega_n);
@@ -288,30 +420,69 @@ public:
         update_ready.store(true, std::memory_order_release);
     }
 
-    // ─── Strike (called from UI thread) ─────────────────────────────────────
-    // Uses MU for modal projection. No pickup_node_idx.
-    void trigger_strike(const Mesh& mesh, const ModeData& modes, double strike_x, double strike_y, double force = 1.0) {
-        std::lock_guard<std::mutex> lock(mutex);
+    // ─── Compute Biquad Filter Coefficients (called on UI param change) ─────
+    void compute_filter_coeffs() {
+        if (filter_update_ready.load(std::memory_order_acquire)) {
+            return;
+        }
 
+        const double fs = 44100.0;
+        double w0 = 2.0 * M_PI * shell_freq / fs;
+        double R = std::exp(-M_PI * shell_freq / (std::max(shell_q, 0.001) * fs));
+
+        // Two-pole resonator coefficients for H_res(z) = 1 / (1 + a1 z^-1 + a2 z^-2)
+        double a1 = -2.0 * R * std::cos(w0);
+        double a2 = R * R;
+
+        // The peak gain of the raw resonator is approximately 1 / (1 - R).
+        // We want the total filter H_total = 1 + c * H_res to have a peak gain
+        // of 10^(gain_db / 20) at resonance.
+        // So 1 + c / (1 - R) = 10^(gain_db / 20) => c = (10^(gain_db / 20) - 1) * (1 - R).
+        double linear_boost = std::pow(10.0, shell_gain_db / 20.0);
+        double c = (linear_boost - 1.0) * (1.0 - R);
+
+        BiquadCoeffs& stg = filter_coeff[2];
+
+        // Parallel formulation gives mathematically perfect zero-phase pass-through when c=0
+        stg.b0 = (float)(1.0 + c);
+        stg.b1 = (float)a1;
+        stg.b2 = (float)a2;
+        stg.a1 = (float)a1;
+        stg.a2 = (float)a2;
+
+        filter_update_ready.store(true, std::memory_order_release);
+    }
+
+    // ─── Reset all modal activity cleanly ────────────────────────────────────
+    void reset_modal_state() {
+        for (int i = 0; i < MAX_MODES; ++i) {
+            modes_state.Z_re[i] = 0.0f;
+            modes_state.Z_im[i] = 0.0f;
+            modes_state.strike_scale[i] = 0.0f;
+            modes_state.active[i] = 0;
+            contact_gamma[i] = 0.0f;
+            contact_psi[i] = 0.0f;
+        }
+        striker.active = false;
+        striker.y = 0.0;
+        striker.v = 0.0;
+        current_strike_time = strike_duration_delta; // disable old bump
+    }
+
+    // ─── Precompute strike coupling arrays ──────────────────────────────────
+    // gamma_force[n]: mass-consistent force projection (MU)
+    // psi_contact[n]: mode-shape displacement readout (U)
+    void prepare_strike_coupling(
+        const Mesh& mesh,
+        const ModeData& modes,
+        double strike_x,
+        double strike_y
+    ) {
         int n_modes = modes.eigenvalues.size();
         if (n_modes > MAX_MODES) n_modes = MAX_MODES;
-        modes_state.count = n_modes;
-
-        // Clear the buffer used for WAV export
-        last_strike_audio.clear();
-
-        double c = wave_speed();
-        const double dt = 1.0 / 44100.0;
-
-        // --- Setup Finite Strike Time Window ---
-        strike_duration_delta = 0.002 / std::max(strike_v0, 0.01);
-        current_strike_time = -strike_duration_delta;
-
-        double temporal_bump_integral = 0.4439938 * strike_duration_delta;
-        double overall_force = force / temporal_bump_integral;
-
-        // --- Pre-compute the spatial distribution weights (bump function) ---
         int J = mesh.vertices.size();
+
+        // --- Build spatial bump F[j] ---
         std::vector<double> F(J, 0.0);
         std::vector<int> active_nodes;
         double F_sum = 0.0;
@@ -320,7 +491,6 @@ public:
             double dx = mesh.vertices[j].x - strike_x;
             double dy = mesh.vertices[j].y - strike_y;
             double r = std::sqrt(dx*dx + dy*dy);
-
             if (r < strike_width_delta) {
                 double xi_r = r / strike_width_delta;
                 F[j] = std::exp(-1.0 / (1.0 - xi_r * xi_r));
@@ -329,7 +499,7 @@ public:
             }
         }
 
-        // Fallback to closest point if delta is so small it misses all nodes
+        // Fallback to closest node
         if (F_sum == 0.0 && J > 0) {
             double min_r = 1e9;
             int closest = 0;
@@ -347,24 +517,144 @@ public:
         // Normalize
         for (int j : active_nodes) F[j] /= F_sum;
 
-        // Read the current coefficient set for E/G values
-        int ci = cur_idx.load(std::memory_order_acquire);
-        const CoeffSet& cur = coeff[ci];
-
-        for (int i = 0; i < n_modes; ++i) {
-            // --- Compute modal excitation using MU (mass-consistent projection) ---
+        // --- Project onto modes ---
+        const Eigen::MatrixXd& U = modes.eigenvectors;
+        for (int n = 0; n < n_modes; ++n) {
             double gamma = 0.0;
+            double psi = 0.0;
             for (int j : active_nodes) {
-                gamma += MU(j, i) * F[j];
+                gamma += MU(j, n) * F[j];   // Mass-consistent force projection
+                psi   += U(j, n)  * F[j];   // Mode-shape displacement readout
             }
+            contact_gamma[n] = (float)gamma;
+            contact_psi[n]   = (float)psi;
+        }
+    }
 
-            // Skip modes not coupled to the strike
-            if (std::abs(gamma) < 1e-4) continue;
+    // ─── Mode and Boundary Precomputation (Milestone 2) ─────────────────────
+    void compute_mode_descriptors(const Mesh& mesh, const ModeData& modes) {
+        // 1. Find boundary nodes (nodes appearing on fewer than 2 * expected element borders, or just use explicitly marked ones if available)
+        // For our simple 2D meshes, we can find nodes shared by edges that only belong to 1 triangle.
+        
+        struct Edge {
+            int v1, v2;
+            bool operator==(const Edge& o) const {
+                return (v1 == o.v1 && v2 == o.v2) || (v1 == o.v2 && v2 == o.v1);
+            }
+        };
+        std::vector<Edge> all_edges;
+        for (const auto& tri : mesh.elements) {
+            all_edges.push_back({tri.v[0], tri.v[1]});
+            all_edges.push_back({tri.v[1], tri.v[2]});
+            all_edges.push_back({tri.v[2], tri.v[0]});
+        }
+        
+        std::vector<int> edge_counts(all_edges.size(), 0);
+        for (size_t i = 0; i < all_edges.size(); ++i) {
+            for (size_t j = 0; j < all_edges.size(); ++j) {
+                if (all_edges[i] == all_edges[j]) edge_counts[i]++;
+            }
+        }
+        
+        std::vector<int> bnd_nodes;
+        for (size_t i = 0; i < all_edges.size(); ++i) {
+            if (edge_counts[i] == 1) { // Boundary edge connects 2 boundary nodes
+                bnd_nodes.push_back(all_edges[i].v1);
+                bnd_nodes.push_back(all_edges[i].v2);
+            }
+        }
+        
+        // Remove duplicates
+        std::sort(bnd_nodes.begin(), bnd_nodes.end());
+        bnd_nodes.erase(std::unique(bnd_nodes.begin(), bnd_nodes.end()), bnd_nodes.end());
+        boundary_nodes = bnd_nodes;
 
-            modes_state.Z_re[i] = 0.0f;
-            modes_state.Z_im[i] = 0.0f;
-            modes_state.strike_scale[i] = (float)(gamma * overall_force);
-            modes_state.active[i] = 1;
+        // 2. Compute E_n^{edge}
+        const Eigen::MatrixXd& U = modes.eigenvectors;
+        int n_modes = modes.eigenvalues.size();
+        if (n_modes > MAX_MODES) n_modes = MAX_MODES;
+
+        for (int n = 0; n < n_modes; ++n) {
+            double edge_energy = 0.0;
+            for (int j : boundary_nodes) {
+                double u = U(j, n);
+                edge_energy += u * u;
+            }
+            // Normalize somewhat by number of boundary nodes to keep scale sane
+            if (!boundary_nodes.empty()) {
+                edge_energy /= boundary_nodes.size();
+            }
+            modal_edge_participation[n] = (float)edge_energy;
+        }
+    }
+
+    double build_mode_damping(int n, double omega_n, double freq_hz) {
+        double d_base = alpha0 + alpha1 * std::pow(freq_hz, beta);
+        
+        double I_vol = modal_air_participation[n];
+        double d_rad = (rho_air * omega_n * omega_n * I_vol * I_vol) / (8.0 * M_PI * c_air * rho_s);
+
+        if (phys.use_mode_dependent_damping) {
+            double d_air  = phys.air_loss_weight * d_rad;
+            // E_edge is inherently quite small (average mode amp squared), apply a scaling factor
+            // A suitable scaling factor makes the tuning slider intuitive (0 -> 100 range)
+            double edge_scale = 1000.0; 
+            double d_edge = phys.edge_loss_weight * modal_edge_participation[n] * edge_scale;
+            return d_base + d_air + d_edge;
+        } else {
+            return d_base + d_rad;
+        }
+    }
+
+    // ─── Centralized coefficient rebuild ────────────────────────────────────
+    void rebuild_physical_coeffs(const Mesh& mesh, const ModeData& modes) {
+        compute_mode_descriptors(mesh, modes);
+        compute_xi(mesh);
+        compute_radiation_weights(modes);
+    }
+
+    // ─── Strike (called from UI thread) ─────────────────────────────────────
+    void trigger_strike(const Mesh& mesh, const ModeData& modes, double strike_x, double strike_y, double force = 1.0) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        int n_modes = modes.eigenvalues.size();
+        if (n_modes > MAX_MODES) n_modes = MAX_MODES;
+        modes_state.count = n_modes;
+
+        // Clear the buffer used for WAV export
+        last_strike_audio.clear();
+
+        // Fully reset all modal state to prevent stale leakage
+        reset_modal_state();
+
+        // Precompute spatial coupling for this strike location
+        prepare_strike_coupling(mesh, modes, strike_x, strike_y);
+
+        if (phys.use_contact_model) {
+            // --- Contact Model: initialize striker DOF ---
+            striker.active = true;
+            striker.y = 0.0;
+            striker.v = phys.striker_initial_velocity * force;
+
+            // Activate all coupled modes
+            for (int i = 0; i < n_modes; ++i) {
+                if (std::abs(contact_gamma[i]) > 1e-6f) {
+                    modes_state.active[i] = 1;
+                }
+            }
+        } else {
+            // --- Old prescribed bump model ---
+            strike_duration_delta = 0.002 / std::max(strike_v0, 0.01);
+            current_strike_time = -strike_duration_delta;
+
+            double temporal_bump_integral = 0.4439938 * strike_duration_delta;
+            double overall_force = force / temporal_bump_integral;
+
+            for (int i = 0; i < n_modes; ++i) {
+                if (std::abs(contact_gamma[i]) < 1e-4f) continue;
+                modes_state.strike_scale[i] = (float)(contact_gamma[i] * overall_force);
+                modes_state.active[i] = 1;
+            }
         }
     }
 
@@ -389,6 +679,12 @@ public:
         if (engine->update_ready.load(std::memory_order_acquire)) {
             // Copy staging (coeff[2]) into fade target buffer
             std::memcpy(&engine->coeff[fi], &engine->coeff[2], sizeof(CoeffSet));
+            // Initialize shell bank with target default modes
+            engine->shell_bank.count = 4;
+            engine->shell_bank.modes[0] = {2.0f * (float)M_PI * 120.0f, 0.05f, 1.0f, 0.0f, 0.0f};
+            engine->shell_bank.modes[1] = {2.0f * (float)M_PI * 210.0f, 0.04f, 0.8f, 0.0f, 0.0f};
+            engine->shell_bank.modes[2] = {2.0f * (float)M_PI * 340.0f, 0.03f, 0.6f, 0.0f, 0.0f};
+            engine->shell_bank.modes[3] = {2.0f * (float)M_PI * 520.0f, 0.02f, 0.4f, 0.0f, 0.0f};
             engine->update_ready.store(false, std::memory_order_release);
             engine->fading = true;
             engine->fade_alpha = 0.0f;
@@ -397,46 +693,118 @@ public:
         const CoeffSet& cur_coeff = engine->coeff[ci];
         const CoeffSet& fade_coeff = engine->coeff[fi];
 
+        // --- Check for new filter update (once per block) ---
+        int filter_ci = engine->cur_filter_idx.load(std::memory_order_acquire);
+        int filter_fi = engine->fade_filter_idx.load(std::memory_order_relaxed);
+
+        if (engine->filter_update_ready.load(std::memory_order_acquire)) {
+            // Unconditionally adopt the newest target coefficients
+            std::memcpy(&engine->filter_coeff[filter_fi], &engine->filter_coeff[2], sizeof(BiquadCoeffs));
+            engine->filter_update_ready.store(false, std::memory_order_release);
+            
+            // Only prime a new fade cycle if we aren't already crossfading.
+            // If we are actively crossfading, simply altering the target coefficients 
+            // allows the slider value to track smoothly without interrupting the ongoing alpha interpolation.
+            if (!engine->fading_filter) {
+                engine->fading_filter = true;
+                engine->fade_filter_alpha = 0.0f;
+                // Prime fade filter state to match current filter state to avoid popping early
+                engine->fade_filter_state = engine->cur_filter_state;
+            }
+        }
+
+        const BiquadCoeffs& cur_filter_c = engine->filter_coeff[filter_ci];
+        const BiquadCoeffs& fade_filter_c = engine->filter_coeff[filter_fi];
+
         for (int i = 0; i < samples; ++i) {
             double sample = 0.0;
 
-            // --- Evaluate current temporal bump force f(t) ---
-            double f_t = 0.0;
-            if (engine->current_strike_time < engine->strike_duration_delta) {
-                double xi_t = engine->current_strike_time / engine->strike_duration_delta;
-                if (xi_t > -1.0 && xi_t < 1.0) {
-                    f_t = std::exp(-1.0 / (1.0 - xi_t * xi_t));
+            // ─── Determine per-sample forcing ────────────────────────────
+            float Fc = 0.0f;  // Contact force (used only in contact model)
+            float f_t_f = 0.0f; // Old bump force (used only in prescribed bump)
+            bool can_deactivate = true;
+
+            if (engine->phys.use_contact_model) {
+                // --- Contact model: compute w_c and w_dot_c from modal state ---
+                if (engine->striker.active) {
+                    double w_contact = 0.0;
+                    double w_contact_vel = 0.0;
+                    for (int m = 0; m < engine->modes_state.count; ++m) {
+                        if (!engine->modes_state.active[m]) continue;
+                        float zr = engine->modes_state.Z_re[m];
+                        float zi = engine->modes_state.Z_im[m];
+                        float psi = engine->contact_psi[m];
+                        // q_n ≈ 2·Re(Z_n)
+                        w_contact += 2.0 * (double)(zr * psi);
+                        // q_dot_n ≈ 2·Re(s_n · Z_n)
+                        float sr = cur_coeff.s_re[m];
+                        float si = cur_coeff.s_im[m];
+                        float sZ_re = sr * zr - si * zi;
+                        w_contact_vel += 2.0 * (double)(sZ_re * psi);
+                    }
+
+                    double delta = engine->striker.y - w_contact;
+                    double delta_dot = engine->striker.v - w_contact_vel;
+
+                    if (delta > 0.0) {
+                        double delta_p = std::pow(delta, engine->phys.striker_exponent);
+                        double force_val = engine->phys.striker_stiffness * delta_p
+                                         + engine->phys.striker_damping * delta_p * delta_dot;
+                        Fc = (float)std::max(0.0, force_val);
+                    }
+
+                    // Update striker dynamics (symplectic Euler)
+                    engine->striker.v -= dt * (double)Fc / engine->phys.striker_mass;
+                    engine->striker.y += dt * engine->striker.v;
+
+                    // Deactivation: striker has rebounded and separated
+                    if (Fc == 0.0f && engine->striker.v <= 0.0 && engine->striker.y <= 0.0) {
+                        engine->striker.active = false;
+                    }
                 }
-                engine->current_strike_time += dt;
+                can_deactivate = !engine->striker.active;
+            } else {
+                // --- Old prescribed bump ---
+                if (engine->current_strike_time < engine->strike_duration_delta) {
+                    double xi_t = engine->current_strike_time / engine->strike_duration_delta;
+                    if (xi_t > -1.0 && xi_t < 1.0) {
+                        f_t_f = (float)std::exp(-1.0 / (1.0 - xi_t * xi_t));
+                    }
+                    engine->current_strike_time += dt;
+                }
+                can_deactivate = engine->current_strike_time >= engine->strike_duration_delta;
             }
 
-            float f_t_f = (float)f_t;
-            bool can_deactivate = engine->current_strike_time >= engine->strike_duration_delta;
-
+            // ─── Modal evolution loop ────────────────────────────────────
             for (int m = 0; m < engine->modes_state.count; ++m) {
                 if (!engine->modes_state.active[m]) continue;
 
                 float zr = engine->modes_state.Z_re[m];
                 float zi = engine->modes_state.Z_im[m];
 
-                // Evolution: ALWAYS uses current E/G (Policy P1: self-consistent dynamics)
-                // G is base coefficient; strike_scale holds the per-mode gamma*force
-                float ss = engine->modes_state.strike_scale[m];
-                float next_zr = (zr * cur_coeff.E_re[m] - zi * cur_coeff.E_im[m]) + cur_coeff.G_re[m] * ss * f_t_f;
-                float next_zi = (zr * cur_coeff.E_im[m] + zi * cur_coeff.E_re[m]) + cur_coeff.G_im[m] * ss * f_t_f;
+                // Determine per-mode forcing
+                float forcing;
+                if (engine->phys.use_contact_model) {
+                    forcing = engine->contact_gamma[m] * Fc;
+                } else {
+                    forcing = engine->modes_state.strike_scale[m] * f_t_f;
+                }
+
+                // Evolution: Z' = E·Z + G·forcing
+                float next_zr = (zr * cur_coeff.E_re[m] - zi * cur_coeff.E_im[m]) + cur_coeff.G_re[m] * forcing;
+                float next_zi = (zr * cur_coeff.E_im[m] + zi * cur_coeff.E_re[m]) + cur_coeff.G_im[m] * forcing;
 
                 engine->modes_state.Z_re[m] = next_zr;
                 engine->modes_state.Z_im[m] = next_zi;
 
-                // Acceleration: a = s²·Z (using current s², consistent with current E)
+                // Acceleration: a = s²·Z
                 float ar = cur_coeff.s2_re[m] * next_zr - cur_coeff.s2_im[m] * next_zi;
                 float ai = cur_coeff.s2_re[m] * next_zi + cur_coeff.s2_im[m] * next_zr;
 
-                // Forcing correction during strike window
-                if (f_t_f > 0.0f) {
-                    float form_f = ss * f_t_f;
-                    ar += cur_coeff.sB_re[m] * form_f;
-                    ai += cur_coeff.sB_im[m] * form_f;
+                // Forcing correction during active forcing window
+                if (forcing != 0.0f) {
+                    ar += cur_coeff.sB_re[m] * forcing;
+                    ai += cur_coeff.sB_im[m] * forcing;
                 }
 
                 // Output: crossfade Phi ONLY (radiation mapping)
@@ -450,8 +818,7 @@ public:
                     pi = cur_coeff.Phi_im[m];
                 }
 
-                // p += 2·Re(conj(Φ)·a) = 2·(Φ_re·a_re + Φ_im·a_im)
-                // Include physical far-field scaling: ρ₀/(2πr)
+                // p += 2·Re(conj(Φ)·a)
                 sample += 2.0 * (pr * ar + pi * ai);
 
                 // Deactivate dead modes
@@ -470,6 +837,25 @@ public:
             // Physical scaling: ρ₀/(2πr) where ρ₀=1.225 kg/m³, r=1m
             sample *= engine->rho_air / (2.0 * M_PI * engine->listener_distance);
 
+            // --- Apply Shell Processing (A/B testing block) ---
+            if (engine->phys.use_shell_bank) {
+                // New multi-mode resonator bank
+                float shell_out = engine->shell_bank.process((float)sample, (float)dt);
+                sample = (1.0 - engine->phys.shell_mix) * sample + engine->phys.shell_mix * shell_out;
+            } else {
+                // Old Biquad Filter
+                float filtered_sample = engine->cur_filter_state.process((float)sample, cur_filter_c);
+                
+                if (engine->fading_filter) {
+                    float fade_filtered = engine->fade_filter_state.process((float)sample, fade_filter_c);
+                    // Clamp alpha between 0 and 1 during rapid updates
+                    float alpha = std::min(engine->fade_filter_alpha, 1.0f);
+                    filtered_sample = (1.0f - alpha) * filtered_sample + alpha * fade_filtered;
+                    engine->fade_filter_alpha += alpha_step;
+                }
+                sample = filtered_sample;
+            }
+
             // Apply user master volume and soft clip
             sample *= engine->master_volume;
             sample = std::tanh(sample);
@@ -486,6 +872,15 @@ public:
             // Now: cur=fi, fade=ci (old cur becomes new fade target for next update)
             engine->fading = false;
             engine->fade_alpha = 0.0f;
+        }
+
+        // --- Commit filter fade at block boundary ---
+        if (engine->fading_filter && engine->fade_filter_alpha >= 1.0f) {
+            engine->cur_filter_idx.store(filter_fi, std::memory_order_release);
+            engine->fade_filter_idx.store(filter_ci, std::memory_order_relaxed);
+            engine->fading_filter = false;
+            engine->fade_filter_alpha = 0.0f;
+            engine->cur_filter_state = engine->fade_filter_state; // Keep state continuous
         }
     }
 };
