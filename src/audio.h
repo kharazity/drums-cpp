@@ -370,10 +370,8 @@ public:
     // ─── Compute radiation weights (call on tension/direction change) ────────
     // Writes into staging buffer. Sets update_ready for callback to pick up.
     void build_coefficients(const ModeData& modes) {
-        // Mailbox discipline: skip if callback hasn't consumed the last update
-        if (update_ready.load(std::memory_order_acquire)) {
-            return;  // Mailbox full — try again next frame
-        }
+        // Mailbox now always overwrites staging buffer with the newest state
+        // to prevent dropping final slider updates.
 
         int n_modes = modes.eigenvalues.size();
         if (n_modes > MAX_MODES) n_modes = MAX_MODES;
@@ -468,9 +466,6 @@ public:
 
     // ─── Compute Biquad Filter Coefficients (called on UI param change) ─────
     void compute_filter_coeffs() {
-        if (filter_update_ready.load(std::memory_order_acquire)) {
-            return;
-        }
 
         const double fs = 44100.0;
         double w0 = 2.0 * M_PI * shell_freq / fs;
@@ -755,7 +750,12 @@ public:
                 // Apply a gentle descending gain and fixed shell-like damping
                 float gain = 1.0f - (k * 0.2f); 
                 float damp = 0.05f - (k * 0.01f);
-                engine->shell_bank.modes[k] = {om, damp, gain, 0.0f, 0.0f};
+                
+                // Update parameters, but do NOT overwrite state buffers (u, v)
+                // so the filter does not pop/reset if adjusted mid-ring
+                engine->shell_bank.modes[k].omega = om;
+                engine->shell_bank.modes[k].damping = damp;
+                engine->shell_bank.modes[k].gain = gain;
             }
             engine->update_ready.store(false, std::memory_order_release);
             engine->fading = true;
