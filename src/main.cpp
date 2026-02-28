@@ -258,6 +258,14 @@ int main(int argc, char* argv[]) {
         audio.phys.use_contact_model = true;
         audio.phys.use_mode_dependent_damping = true;
         audio.phys.use_shell_bank = true;
+        audio.phys.shell_mix = 0.2;
+
+        // Pickup Mix
+        audio.mix_vel = 0.65;
+        audio.mix_accel = 0.25;
+        audio.mix_disp = 0.10;
+        audio.pickup_x = 0.0;
+        audio.pickup_y = 0.0;
     }
 
     bool done = false;
