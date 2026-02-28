@@ -664,7 +664,7 @@ public:
             double d_edge = phys.edge_loss_weight * modal_edge_participation[n] * edge_scale;
             return d_base + d_air + d_edge;
         } else {
-            return d_base;// + d_rad;
+            return d_base;
         }
     }
 

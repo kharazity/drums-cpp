@@ -397,9 +397,7 @@ int main(int argc, char* argv[]) {
                         // Precompute radiation weights for first mesh
                         if (!fems.empty() && !all_modes.empty()) {
                             audio.precompute_MU(fems[0], all_modes[0]);
-                            audio.compute_mode_descriptors(meshes[0], all_modes[0]);
-                            audio.compute_xi(meshes[0]);
-                            audio.build_coefficients(all_modes[0]);
+                            audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
                         }
                         
                         freqs.clear();
@@ -544,8 +542,7 @@ int main(int argc, char* argv[]) {
                                         fems.push_back(f);
                                         all_modes.push_back(Solver::solve(f, n_modes));
                                         audio.precompute_MU(fems[0], all_modes[0]);
-                                        audio.compute_xi(meshes[0]);
-                                        audio.build_coefficients(all_modes[0]);
+                                        audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
                                     }
                                 }
 
@@ -600,8 +597,7 @@ int main(int argc, char* argv[]) {
                                     all_modes.push_back(Solver::solve(f, n_modes));
 
                                     audio.precompute_MU(fems[0], all_modes[0]);
-                                    audio.compute_xi(meshes[0]);
-                                    audio.build_coefficients(all_modes[0]);
+                                    audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
 
                                     freqs.clear();
                                     {
@@ -970,6 +966,8 @@ int main(int argc, char* argv[]) {
                             if (hit_mesh_idx != -1) {
                                 dragged_mesh_idx = hit_mesh_idx;
                                 last_struck_mesh = hit_mesh_idx;
+                                audio.precompute_MU(fems[hit_mesh_idx], all_modes[hit_mesh_idx]);
+                                audio.rebuild_physical_coeffs(meshes[hit_mesh_idx], all_modes[hit_mesh_idx]);
                                 audio.trigger_strike(meshes[hit_mesh_idx], all_modes[hit_mesh_idx], wx, wy, 1.0);
                             }
                         }
@@ -1045,9 +1043,7 @@ int main(int argc, char* argv[]) {
                                 fems.push_back(f);
                                 all_modes.push_back(Solver::solve(f, n_modes));
                                 audio.precompute_MU(fems[0], all_modes[0]);
-                                audio.compute_mode_descriptors(meshes[0], all_modes[0]);
-                                audio.compute_xi(meshes[0]);
-                                audio.build_coefficients(all_modes[0]);
+                                audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
                                 freqs.clear();
                                 {
                                     std::lock_guard<std::mutex> lock(audio.mutex);
