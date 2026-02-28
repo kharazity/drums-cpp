@@ -37,9 +37,7 @@ int main(int argc, char* argv[]) {
     fems[0].assemble(meshes[0]);
     all_modes.push_back(Solver::solve(fems[0], 60));
     audio.precompute_MU(fems[0], all_modes[0]);
-    audio.compute_mode_descriptors(meshes[0], all_modes[0]);
-    audio.compute_xi(meshes[0]);
-    audio.build_coefficients(all_modes[0]);
+    audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
     
     // Visualization State
     float zoom = 300.0f;
@@ -266,6 +264,11 @@ int main(int argc, char* argv[]) {
         audio.mix_disp = 0.10;
         audio.pickup_x = 0.0;
         audio.pickup_y = 0.0;
+
+        if (!meshes.empty() && !all_modes.empty()) {
+            audio.compute_pickup_weights(meshes[0], all_modes[0]);
+            audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
+        }
     }
 
     bool done = false;
