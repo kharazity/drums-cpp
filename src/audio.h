@@ -327,7 +327,7 @@ public:
 
     // ─── Compute radiation weights (call on tension/direction change) ────────
     // Writes into staging buffer. Sets update_ready for callback to pick up.
-    void compute_radiation_weights(const ModeData& modes) {
+    void build_coefficients(const ModeData& modes) {
         // Mailbox discipline: skip if callback hasn't consumed the last update
         if (update_ready.load(std::memory_order_acquire)) {
             return;  // Mailbox full — try again next frame
@@ -626,7 +626,7 @@ public:
     void rebuild_physical_coeffs(const Mesh& mesh, const ModeData& modes) {
         compute_mode_descriptors(mesh, modes);
         compute_xi(mesh);
-        compute_radiation_weights(modes);
+        build_coefficients(modes);
     }
 
     // ─── Strike (called from UI thread) ─────────────────────────────────────
