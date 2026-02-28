@@ -684,6 +684,21 @@ public:
         // Fully reset all modal state to prevent stale leakage
         reset_modal_state();
 
+        // Initialize shell bank with actual drum modes from the staging buffer
+        // This is explicitly done per-strike so that tuning changes do not pop the ongoing acoustic ring.
+        shell_bank.count = std::min(4, modes_state.count);
+        for (int k = 0; k < shell_bank.count; ++k) {
+            float om = coeff[2].omega[k];
+            float gain = 1.0f - (k * 0.2f); 
+            float damp = 0.05f - (k * 0.01f);
+            
+            shell_bank.modes[k].omega = om;
+            shell_bank.modes[k].damping = damp;
+            shell_bank.modes[k].gain = gain;
+            shell_bank.modes[k].x = 0.0f;
+            shell_bank.modes[k].v = 0.0f;
+        }
+
         // Precompute spatial coupling for this strike location
         prepare_strike_coupling(mesh, modes, strike_x, strike_y);
 
@@ -741,22 +756,6 @@ public:
         if (engine->update_ready.load(std::memory_order_acquire)) {
             // Copy staging (coeff[2]) into fade target buffer
             std::memcpy(&engine->coeff[fi], &engine->coeff[2], sizeof(CoeffSet));
-            // Initialize shell bank with target default modes
-            // Initialize shell bank with actual drum modes from the staging buffer
-            engine->shell_bank.count = std::min(4, engine->modes_state.count);
-            for (int k = 0; k < engine->shell_bank.count; ++k) {
-                // Read the actual computed angular frequency from the newly staged CoeffSet
-                float om = engine->coeff[2].omega[k];
-                // Apply a gentle descending gain and fixed shell-like damping
-                float gain = 1.0f - (k * 0.2f); 
-                float damp = 0.05f - (k * 0.01f);
-                
-                // Update parameters, but do NOT overwrite state buffers (u, v)
-                // so the filter does not pop/reset if adjusted mid-ring
-                engine->shell_bank.modes[k].omega = om;
-                engine->shell_bank.modes[k].damping = damp;
-                engine->shell_bank.modes[k].gain = gain;
-            }
             engine->update_ready.store(false, std::memory_order_release);
             engine->fading = true;
             engine->fade_alpha = 0.0f;
