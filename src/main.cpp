@@ -230,6 +230,36 @@ int main(int argc, char* argv[]) {
     float current_damping_macro = 0.5f;
     float current_hit_strength = 5.0f;
 
+    // --- Synchronize Audio Engine with initial UI defaults ---
+    {
+        // 1. Initial Velocity (Hit Strength)
+        audio.strike_v0 = (double)current_hit_strength;
+        audio.phys.striker_initial_velocity = (double)current_hit_strength;
+
+        // 2. Beater Preset & Hardness
+        const auto& b = BEATER_PRESETS[current_beater_idx];
+        audio.phys.striker_mass = b.mass;
+        audio.phys.striker_stiffness = b.K_lo + current_beater_hardness * (b.K_hi - b.K_lo);
+        audio.phys.striker_damping = b.R_lo + current_beater_hardness * (b.R_hi - b.R_lo);
+        audio.phys.striker_exponent = b.exponent;
+        audio.strike_width_delta = b.width;
+
+        // 3. Environment (Mic Setup)
+        const auto& m = MIC_PRESETS[current_mic_idx];
+        audio.listener_elevation = m.elev;
+        audio.listener_azimuth = m.azim;
+
+        // 4. Custom Damping / Muffling
+        audio.alpha0 = 0.5 + current_damping_macro * 19.5;
+        audio.phys.air_loss_weight = 0.5 + current_damping_macro * 2.5;
+        audio.phys.edge_loss_weight = 0.0 + current_damping_macro * 50.0;
+        
+        // Ensure advanced nonlinear physics are enabled by default, as the GUI assumes
+        audio.phys.use_contact_model = true;
+        audio.phys.use_mode_dependent_damping = true;
+        audio.phys.use_shell_bank = true;
+    }
+
     bool done = false;
     while (!done) {
         SDL_Event event;
@@ -425,12 +455,14 @@ int main(int argc, char* argv[]) {
                         audio.alpha0 = 0.5 + current_damping_macro * 19.5;
                         audio.phys.air_loss_weight = 0.5 + current_damping_macro * 2.5;
                         audio.phys.edge_loss_weight = 0.0 + current_damping_macro * 50.0;
+                        audio.phys.use_mode_dependent_damping = true; // Auto-enable the advanced physics flag
                         if (!all_modes.empty()) audio.build_coefficients(all_modes[0]);
                     }
 
                     float mix_f = (float)audio.phys.shell_mix;
                     if (ImGui::SliderFloat("Body", &mix_f, 0.0f, 1.0f, "%.2f")) {
                         audio.phys.shell_mix = (double)mix_f;
+                        audio.phys.use_shell_bank = true; // Auto-enable the advanced physics flag
                     }
 
                     ImGui::Separator();
