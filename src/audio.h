@@ -89,6 +89,10 @@ struct CoeffSet {
     float sB_im[MAX_MODES]  = {};   // Forcing correction s·B imag
     float s_re[MAX_MODES]   = {};   // s_n real part: -d_n
     float s_im[MAX_MODES]   = {};   // s_n imag part: ω_n
+    
+    // Extracted raw physical parameters for per-mode state-dependent updates
+    float omega[MAX_MODES]   = {};  // Angular frequency (rad/s)
+    float damping[MAX_MODES] = {};  // Damping coefficient (1/s)
 };
 
 // ─── Modal State (phasor Z, activity flags) ─────────────────────────────────
@@ -368,6 +372,10 @@ public:
             // Damping (clamped to underdamped regime)
             double d_n = build_mode_damping(n, omega_n, freq_hz);
             d_n = std::min(d_n, 0.95 * omega_n);
+            
+            // Store raw physical constants for real-time modulation queries
+            stg.omega[n] = (float)omega_n;
+            stg.damping[n] = (float)d_n;
 
             // s_n = -d_n + i·ω_n
             stg.s_re[n] = (float)(-d_n);
@@ -682,7 +690,12 @@ public:
 
         memset(stream, 0, len);
 
-        std::lock_guard<std::mutex> lock(engine->mutex);
+        // Try to acquire lock. If UI thread is busy (e.g., rebuilding mesh or processing 
+        // a new strike), we do NOT block the audio thread. We just output the zeroed buffer.
+        std::unique_lock<std::mutex> lock(engine->mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return;
+        }
 
         const double dt = 1.0 / 44100.0;
         const float alpha_step = 1.0f / (FADE_DURATION_S * 44100.0f);
