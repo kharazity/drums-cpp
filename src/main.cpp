@@ -465,6 +465,15 @@ int main(int argc, char* argv[]) {
                         audio.phys.use_shell_bank = true; // Auto-enable the advanced physics flag
                     }
 
+                    ImGui::Spacing();
+                    ImGui::Text("Pickup Mix");
+                    float m_disp = (float)audio.mix_disp;
+                    if (ImGui::SliderFloat("Displacement (Warm)", &m_disp, 0.0f, 1.0f, "%.2f")) audio.mix_disp = (double)m_disp;
+                    float m_vel = (float)audio.mix_vel;
+                    if (ImGui::SliderFloat("Velocity (Natural)", &m_vel, 0.0f, 1.0f, "%.2f")) audio.mix_vel = (double)m_vel;
+                    float m_accel = (float)audio.mix_accel;
+                    if (ImGui::SliderFloat("Radiation (Bright)", &m_accel, 0.0f, 1.0f, "%.2f")) audio.mix_accel = (double)m_accel;
+
                     ImGui::Separator();
                     ImGui::Text("Environment");
 
@@ -614,6 +623,21 @@ int main(int argc, char* argv[]) {
                         if (!all_modes.empty()) audio.build_coefficients(all_modes[0]);
                     }
                     ImGui::Checkbox("Use Multi-Mode Shell Bank", &audio.phys.use_shell_bank);
+
+                    ImGui::Separator();
+                    ImGui::Text("Pickup Sensor Position");
+                    float px = (float)audio.pickup_x;
+                    float py = (float)audio.pickup_y;
+                    bool pos_changed = false;
+                    pos_changed |= ImGui::SliderFloat("Pickup X (m)", &px, -0.5f, 0.5f, "%.3f");
+                    pos_changed |= ImGui::SliderFloat("Pickup Y (m)", &py, -0.5f, 0.5f, "%.3f");
+                    if (pos_changed) {
+                        audio.pickup_x = (double)px;
+                        audio.pickup_y = (double)py;
+                        if (!meshes.empty() && !all_modes.empty()) {
+                            audio.compute_pickup_weights(meshes[0], all_modes[0]);
+                        }
+                    }
 
                     if (audio.phys.use_contact_model) {
                         ImGui::Separator();

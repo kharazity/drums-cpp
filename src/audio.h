@@ -93,6 +93,7 @@ struct CoeffSet {
     // Extracted raw physical parameters for per-mode state-dependent updates
     float omega[MAX_MODES]   = {};  // Angular frequency (rad/s)
     float damping[MAX_MODES] = {};  // Damping coefficient (1/s)
+    float pickup_psi[MAX_MODES] = {}; // Mode shape magnitude at the pickup location
 };
 
 // ─── Modal State (phasor Z, activity flags) ─────────────────────────────────
@@ -222,6 +223,13 @@ public:
     double listener_azimuth   = 0.0;  // Degrees
     double master_volume = 10.0;    // User-adjustable master volume
     
+    // ─── Pickup Mix Parameters (Displacement, Velocity, Acceleration) ───────
+    double pickup_x = 0.0;          // Pickup coordinate X
+    double pickup_y = 0.0;          // Pickup coordinate Y
+    double mix_vel  = 0.65;         // Velocity mix ratio
+    double mix_accel = 0.25;        // Far-field acceleration mix ratio
+    double mix_disp  = 0.10;        // Displacement mix ratio
+
     // ─── Shell Resonance Filter Parameters ──────────────────────────────────
     double shell_freq = 200.0;      // Resonance Frequency (Hz) (Old Biquad)
     double shell_q = 5.0;           // Q Factor
@@ -328,6 +336,35 @@ public:
         for (int j = 0; j < J; ++j) {
             xi[j] -= xi_mean;
         }
+    }
+
+    // ─── Compute pickup weights (call on pickup position change) ─────────────
+    // Writes into staging buffer. Sets update_ready for callback to pick up.
+    void compute_pickup_weights(const Mesh& mesh, const ModeData& modes) {
+        int J = mesh.vertices.size();
+        if (J == 0) return;
+
+        // 1. Find the closest vertex to (pickup_x, pickup_y)
+        double min_r = 1e9;
+        int closest = 0;
+        for (int j = 0; j < J; ++j) {
+            double dx = mesh.vertices[j].x - pickup_x;
+            double dy = mesh.vertices[j].y - pickup_y;
+            double r = dx*dx + dy*dy;
+            if (r < min_r) { min_r = r; closest = j; }
+        }
+
+        // 2. Sample eigenvectors at the pickup location
+        int n_modes = modes.eigenvalues.size();
+        if (n_modes > MAX_MODES) n_modes = MAX_MODES;
+        
+        CoeffSet& stg = coeff[2]; // Target staging buffer
+        for (int n = 0; n < n_modes; ++n) {
+            stg.pickup_psi[n] = (float)modes.eigenvectors(closest, n);
+        }
+        
+        // Signal the audio thread that coeff[2] has been updated
+        update_ready.store(true, std::memory_order_release);
     }
 
     // ─── Compute radiation weights (call on tension/direction change) ────────
@@ -627,7 +664,7 @@ public:
             double d_edge = phys.edge_loss_weight * modal_edge_participation[n] * edge_scale;
             return d_base + d_air + d_edge;
         } else {
-            return d_base + d_rad;
+            return d_base;// + d_rad;
         }
     }
 
@@ -811,6 +848,10 @@ public:
             }
 
             // ─── Modal evolution loop ────────────────────────────────────
+            double sum_radiation = 0.0;
+            double sum_disp = 0.0;
+            double sum_vel = 0.0;
+
             for (int m = 0; m < engine->modes_state.count; ++m) {
                 if (!engine->modes_state.active[m]) continue;
 
@@ -832,6 +873,15 @@ public:
                 engine->modes_state.Z_re[m] = next_zr;
                 engine->modes_state.Z_im[m] = next_zi;
 
+                // ---- Pickup Extraction (Displacement and Velocity) ----
+                float psi = cur_coeff.pickup_psi[m];
+                float disp_n = 2.0f * next_zr;
+                float vel_n  = 2.0f * (cur_coeff.s_re[m] * next_zr - cur_coeff.s_im[m] * next_zi);
+                
+                sum_disp += disp_n * psi;
+                sum_vel  += vel_n * psi;
+
+                // ---- Far-Field Extraction (Acceleration) ----
                 // Acceleration: a = s²·Z
                 float ar = cur_coeff.s2_re[m] * next_zr - cur_coeff.s2_im[m] * next_zi;
                 float ai = cur_coeff.s2_re[m] * next_zi + cur_coeff.s2_im[m] * next_zr;
@@ -853,8 +903,8 @@ public:
                     pi = cur_coeff.Phi_im[m];
                 }
 
-                // p += 2·Re(conj(Φ)·a)
-                sample += 2.0 * (pr * ar + pi * ai);
+                // sum_radiation = Σ 2·Re(conj(Φ)·a)
+                sum_radiation += 2.0 * (pr * ar + pi * ai);
 
                 // Deactivate dead modes
                 if (can_deactivate && (next_zr * next_zr + next_zi * next_zi) < 1e-16f) {
@@ -864,13 +914,22 @@ public:
                 }
             }
 
+            // Apply spatial scaling to the far-field term
+            sum_radiation *= engine->rho_air / (2.0 * M_PI * engine->listener_distance);
+
+            // Mix down final output using triple-mix coefficients
+            sample = (engine->mix_disp * sum_disp) 
+                   + (engine->mix_vel * sum_vel) 
+                   + (engine->mix_accel * sum_radiation);
+
             // Advance crossfade alpha
             if (engine->fading) {
                 engine->fade_alpha += alpha_step;
             }
 
             // Physical scaling: ρ₀/(2πr) where ρ₀=1.225 kg/m³, r=1m
-            sample *= engine->rho_air / (2.0 * M_PI * engine->listener_distance);
+            // This line is now handled inside update_modal_bank for the radiation term
+            // sample *= engine->rho_air / (2.0 * M_PI * engine->listener_distance);
 
             // --- Apply Shell Processing (A/B testing block) ---
             if (engine->phys.use_shell_bank) {
