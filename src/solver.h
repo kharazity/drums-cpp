@@ -63,7 +63,14 @@ class Solver {
 public:
     static ModeData solve(const FEM& fem, int n_modes, double sigma = -1.0) {
         int n_free = fem.free_dofs.size();
-        if (n_free < n_modes) n_modes = n_free - 1;
+        if (n_free <= 1) {
+            // Degenerate mesh with no internal degrees of freedom
+            ModeData fallback;
+            fallback.eigenvalues = Eigen::VectorXd::Zero(1);
+            fallback.eigenvectors = Eigen::MatrixXd::Zero(fem.K.rows(), 1);
+            return fallback;
+        }
+        if (n_modes >= n_free) n_modes = n_free - 1;
         
         // Extract Submatrices (as before)
         std::vector<int> global_to_free(fem.K.rows(), -1);
