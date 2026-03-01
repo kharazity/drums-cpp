@@ -74,7 +74,7 @@ inline bool write_wav_file(const char* filename, const std::vector<float>& sampl
 // ─── Far-Field Radiation Coefficient Set ────────────────────────────────────
 // Per-mode coefficients used by the audio callback.
 // Three instances exist for lock-free triple-buffering.
-static constexpr int MAX_MODES = 256;
+static constexpr int MAX_MODES = 2048;
 
 struct CoeffSet {
     float Phi_re[MAX_MODES] = {};   // Radiation weight Φ_n (unconjugated, real part)

@@ -1226,21 +1226,22 @@ int main(int argc, char* argv[]) {
                         const CoeffSet& cc = audio.coeff[ci];
                         double phys_scale = audio.rho_air / (2.0 * M_PI * audio.listener_distance);
                         
-                        if (audio.modes_state.count == (int)active_modes_data.eigenvalues.size()) {
-                            for(size_t i = 0; i < active_modes_data.eigenvalues.size(); ++i) {
-                                float zr = audio.modes_state.Z_re[i];
-                                float zi = audio.modes_state.Z_im[i];
-                                // Acceleration: a = s²·Z
-                                float ar = cc.s2_re[i] * zr - cc.s2_im[i] * zi;
-                                float ai = cc.s2_re[i] * zi + cc.s2_im[i] * zr;
-                                float p = 2.0f * (cc.Phi_re[i] * ar + cc.Phi_im[i] * ai) * (float)phys_scale;
-                                float mag = std::fabs(p);
-                                float db = (mag > 1e-20f) ? 20.0f * std::log10(mag) : -120.0f;
-                                // Shift so -120 dB is drawn at y=0, loud sounds shoot upward
-                                amps[i] = std::max(0.0f, db + 120.0f);
-                            }
-                        } else {
-                            std::fill(amps.begin(), amps.end(), 0.0f);
+                        int render_count = std::min(audio.modes_state.count, (int)active_modes_data.eigenvalues.size());
+                        for(int i = 0; i < render_count; ++i) {
+                            float zr = audio.modes_state.Z_re[i];
+                            float zi = audio.modes_state.Z_im[i];
+                            // Acceleration: a = s²·Z
+                            float ar = cc.s2_re[i] * zr - cc.s2_im[i] * zi;
+                            float ai = cc.s2_re[i] * zi + cc.s2_im[i] * zr;
+                            float p = 2.0f * (cc.Phi_re[i] * ar + cc.Phi_im[i] * ai) * (float)phys_scale;
+                            float mag = std::fabs(p);
+                            float db = (mag > 1e-20f) ? 20.0f * std::log10(mag) : -120.0f;
+                            // Shift so -120 dB is drawn at y=0, loud sounds shoot upward
+                            amps[i] = std::max(0.0f, db + 120.0f);
+                        }
+                        // Zero out the rest
+                        for (int i = render_count; i < (int)active_modes_data.eigenvalues.size(); ++i) {
+                            amps[i] = 0.0f;
                         }
                     }
                     
