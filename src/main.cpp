@@ -402,7 +402,7 @@ int main(int argc, char* argv[]) {
                         if (!fems.empty() && !all_modes.empty()) {
                             audio.precompute_MU(fems[0], all_modes[0]);
                             audio.compute_pickup_weights(meshes[0], all_modes[0]);
-                            audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
+                            audio.rebuild_tension_grid(meshes[0], all_modes[0]);
                         }
                         
                         freqs.clear();
@@ -426,7 +426,7 @@ int main(int argc, char* argv[]) {
                         audio.tension = (double)tension_f;
                         // Debounced radiation weight recompute on tension change
                         if (!all_modes.empty()) {
-                            audio.build_coefficients(all_modes[0]);
+                            audio.rebuild_tension_grid(meshes[0], all_modes[0]);
                         }
                     }
 
@@ -467,7 +467,7 @@ int main(int argc, char* argv[]) {
                         audio.phys.air_loss_weight = 0.5 + current_damping_macro * 2.5;
                         audio.phys.edge_loss_weight = 0.0 + current_damping_macro * 50.0;
                         audio.phys.use_mode_dependent_damping = true; // Auto-enable the advanced physics flag
-                        if (!all_modes.empty()) audio.build_coefficients(all_modes[0]);
+                        if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]);
                     }
 
                     float mix_f = (float)audio.phys.shell_mix;
@@ -494,7 +494,7 @@ int main(int argc, char* argv[]) {
                         audio.listener_elevation = m.elev;
                         audio.listener_azimuth = m.azim;
                         if (!meshes.empty()) audio.compute_xi(meshes[0]);
-                        if (!all_modes.empty()) audio.build_coefficients(all_modes[0]);
+                        if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]);
                     }
 
                     float vol_f = (float)audio.master_volume;
@@ -604,7 +604,7 @@ int main(int argc, char* argv[]) {
 
                                     audio.precompute_MU(fems[0], all_modes[0]);
                                     audio.compute_pickup_weights(meshes[0], all_modes[0]);
-                                    audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
+                                    audio.rebuild_tension_grid(meshes[0], all_modes[0]);
 
                                     freqs.clear();
                                     {
@@ -631,9 +631,28 @@ int main(int argc, char* argv[]) {
                     ImGui::Checkbox("Diagnosis Mode (Bypass FX & Master Vol)", &audio.diagnosis_mode);
                     ImGui::Checkbox("Use Contact Striker", &audio.phys.use_contact_model);
                     if (ImGui::Checkbox("Mode-Dependent Damping", &audio.phys.use_mode_dependent_damping)) {
-                        if (!all_modes.empty()) audio.build_coefficients(all_modes[0]);
+                        if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]);
                     }
                     ImGui::Checkbox("Use Multi-Mode Shell Bank", &audio.phys.use_shell_bank);
+
+                    ImGui::Separator();
+                    ImGui::Text("Nonlinear Acoustics");
+                    float nonlin_f = (float)audio.nonlinearity;
+                    if (ImGui::SliderFloat("Pitch Glide (Energy)", &nonlin_f, 0.0f, 10.0f, "%.2f")) {
+                        audio.nonlinearity = (double)nonlin_f;
+                    }
+
+                    // Optional smoothing time (in ms)
+                     float smoothing_ms = 1000.0f * (1.0f - std::pow(1.0f - audio.energy_alpha, 44100.0f));
+                     // A more intuitive approximation for UI: alpha = 1.0 - exp(-dt / tau), where tau = ms / 1000
+                     // But strictly, alpha ~ dt / tau where tau is time constant.
+                     // So tau = dt / alpha  => ms = 1000 * dt / alpha
+                     // Actually let's use a simpler mapping: alpha = dt / (ms / 1000)
+                     float ms = (1000.0f / 44100.0f) / audio.energy_alpha;
+                     if (ImGui::SliderFloat("Glide Smoothing (ms)", &ms, 1.0f, 500.0f, "%.1f")) {
+                         audio.energy_alpha = (1000.0f / 44100.0f) / ms;
+                         if (audio.energy_alpha > 1.0f) audio.energy_alpha = 1.0f;
+                     }
 
                     ImGui::Separator();
                     ImGui::Text("Pickup Sensor Position");
@@ -668,17 +687,17 @@ int main(int argc, char* argv[]) {
                     ImGui::Separator();
                     ImGui::Text("Raw Damping");
                     float alpha0_f = (float)audio.alpha0;
-                    if (ImGui::SliderFloat("Base Damping (a0)", &alpha0_f, 0.1f, 50.0f, "%.1f")) { audio.alpha0 = (double)alpha0_f; if (!all_modes.empty()) audio.build_coefficients(all_modes[0]); }
+                    if (ImGui::SliderFloat("Base Damping (a0)", &alpha0_f, 0.1f, 50.0f, "%.1f")) { audio.alpha0 = (double)alpha0_f; if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]); }
                     float alpha1_f = (float)audio.alpha1;
-                    if (ImGui::SliderFloat("Base Freq Damp (a1)", &alpha1_f, 0.0f, 0.05f, "%.5f")) { audio.alpha1 = (double)alpha1_f; if (!all_modes.empty()) audio.build_coefficients(all_modes[0]); }
+                    if (ImGui::SliderFloat("Base Freq Damp (a1)", &alpha1_f, 0.0f, 0.05f, "%.5f")) { audio.alpha1 = (double)alpha1_f; if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]); }
                     float beta_f = (float)audio.beta;
-                    if (ImGui::SliderFloat("Base Freq Power (beta)", &beta_f, 0.5f, 3.0f, "%.2f")) { audio.beta = (double)beta_f; if (!all_modes.empty()) audio.build_coefficients(all_modes[0]); }
+                    if (ImGui::SliderFloat("Base Freq Power (beta)", &beta_f, 0.5f, 3.0f, "%.2f")) { audio.beta = (double)beta_f; if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]); }
                     
                     if (audio.phys.use_mode_dependent_damping) {
                         float air_w_f = (float)audio.phys.air_loss_weight;
-                        if (ImGui::SliderFloat("Air Loss Weight", &air_w_f, 0.0f, 5.0f, "%.2f")) { audio.phys.air_loss_weight = (double)air_w_f; if (!all_modes.empty()) audio.build_coefficients(all_modes[0]); }
+                        if (ImGui::SliderFloat("Air Loss Weight", &air_w_f, 0.0f, 5.0f, "%.2f")) { audio.phys.air_loss_weight = (double)air_w_f; if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]); }
                         float edge_w_f = (float)audio.phys.edge_loss_weight;
-                        if (ImGui::SliderFloat("Edge Loss Weight", &edge_w_f, 0.0f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) { audio.phys.edge_loss_weight = (double)edge_w_f; if (!all_modes.empty()) audio.build_coefficients(all_modes[0]); }
+                        if (ImGui::SliderFloat("Edge Loss Weight", &edge_w_f, 0.0f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) { audio.phys.edge_loss_weight = (double)edge_w_f; if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]); }
                     }
 
                     if (!audio.phys.use_shell_bank) {
@@ -705,13 +724,13 @@ int main(int argc, char* argv[]) {
                     if (ImGui::SliderFloat("Elevation (deg)", &elevation_f, 0.0f, 90.0f, "%.1f")) {
                         audio.listener_elevation = (double)elevation_f;
                         if (!meshes.empty()) audio.compute_xi(meshes[0]);
-                        if (!all_modes.empty()) audio.build_coefficients(all_modes[0]);
+                        if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]);
                     }
                     float azimuth_f = (float)audio.listener_azimuth;
                     if (ImGui::SliderFloat("Azimuth (deg)", &azimuth_f, 0.0f, 360.0f, "%.1f")) {
                         audio.listener_azimuth = (double)azimuth_f;
                         if (!meshes.empty()) audio.compute_xi(meshes[0]);
-                        if (!all_modes.empty()) audio.build_coefficients(all_modes[0]);
+                        if (!all_modes.empty()) audio.rebuild_tension_grid(meshes[0], all_modes[0]);
                     }
 
                     ImGui::Separator();
@@ -942,9 +961,8 @@ int main(int argc, char* argv[]) {
                                 fems.push_back(f);
                                 all_modes.push_back(Solver::solve(f, n_modes));
                                 audio.precompute_MU(fems[0], all_modes[0]);
-                                audio.compute_mode_descriptors(meshes[0], all_modes[0]);
-                                audio.compute_xi(meshes[0]);
-                                audio.build_coefficients(all_modes[0]);
+                                audio.compute_pickup_weights(meshes[0], all_modes[0]);
+                                audio.rebuild_tension_grid(meshes[0], all_modes[0]);
                             }
                         } else if (hovered_cp != -1) {
                             // Grab control point
@@ -975,7 +993,7 @@ int main(int argc, char* argv[]) {
                                 last_struck_mesh = hit_mesh_idx;
                                 audio.precompute_MU(fems[hit_mesh_idx], all_modes[hit_mesh_idx]);
                                 audio.compute_pickup_weights(meshes[hit_mesh_idx], all_modes[hit_mesh_idx]);
-                                audio.rebuild_physical_coeffs(meshes[hit_mesh_idx], all_modes[hit_mesh_idx]);
+                                audio.rebuild_tension_grid(meshes[hit_mesh_idx], all_modes[hit_mesh_idx]);
                                 audio.trigger_strike(meshes[hit_mesh_idx], all_modes[hit_mesh_idx], wx, wy, 1.0);
                             }
                         }
@@ -1221,9 +1239,8 @@ int main(int argc, char* argv[]) {
                     // Get current amplitudes from Audio Engine (in dB)
                     // Show radiated pressure per mode (not raw displacement)
                     {
-                        std::lock_guard<std::mutex> lock(audio.mutex);
-                        int ci = audio.cur_idx.load(std::memory_order_acquire);
-                        const CoeffSet& cc = audio.coeff[ci];
+                        int ci = audio.active_tension_grid.load(std::memory_order_acquire);
+                        const CoeffSet& cc = audio.tension_coeffs[ci][AudioEngine::BASE_TENSION_IDX];
                         double phys_scale = audio.rho_air / (2.0 * M_PI * audio.listener_distance);
                         
                         int render_count = std::min(audio.modes_state.count, (int)active_modes_data.eigenvalues.size());

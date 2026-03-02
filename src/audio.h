@@ -250,15 +250,25 @@ public:
     float modal_edge_participation[MAX_MODES] = {};
     float modal_air_participation[MAX_MODES] = {};
 
-    // ─── Three-Buffer Coefficients (lock-free, fixed staging) ────────────────
-    // coeff[0], coeff[1] = live buffers rotated between cur/fade by callback
-    // coeff[2] = ALWAYS staging (UI writes here, callback never reads directly)
-    CoeffSet coeff[3];
-    std::atomic<int> cur_idx{0};        // Callback reads E/G/s²/Phi from this
-    std::atomic<int> fade_idx{1};       // Callback crossfades Phi toward this
-    // No staging_idx: staging is always coeff[2]
-    std::atomic<bool> update_ready{false};  // Mailbox flag: UI sets, callback clears
+    // ─── Tension Modulation Grid ─────────────────────────────────────────────
+    static constexpr int TENSION_GRID_SIZE = 3;
+    static constexpr float TENSION_GRID_VALS[TENSION_GRID_SIZE] = {0.95f, 1.0f, 1.05f};
+    static constexpr int BASE_TENSION_IDX = 1;   // index of multiplier 1.0
 
+    // Double-buffered grid: two buffers each containing TENSION_GRID_SIZE CoeffSet objects
+    CoeffSet tension_coeffs[2][TENSION_GRID_SIZE];
+    std::atomic<int> active_tension_grid{0};
+
+    // User parameter: nonlinearity (0 = off) and smoothed energy
+    float nonlinearity = 0.0f;
+    float energy_smooth = 0.0f;
+    float energy_alpha = 0.0001f;   // smoothing factor (can be fixed)
+
+    // Double-buffered pickup weights (tension-independent)
+    float pickup_psi_buffers[2][MAX_MODES];
+    std::atomic<int> active_pickup_idx{0};
+
+    // Multi-mode filter for entire drum body resonance
     BiquadCoeffs filter_coeff[3];
     std::atomic<int> cur_filter_idx{0};
     std::atomic<int> fade_filter_idx{1};
@@ -267,8 +277,6 @@ public:
     BiquadState fade_filter_state;
 
     // ─── Crossfade State (only touched by callback) ─────────────────────────
-    bool fading = false;
-    float fade_alpha = 0.0f;
     bool fading_filter = false;
     float fade_filter_alpha = 0.0f;
     static constexpr float FADE_DURATION_S = 0.02f; // 20ms crossfade
@@ -339,7 +347,7 @@ public:
     }
 
     // ─── Compute pickup weights (call on pickup position change) ─────────────
-    // Writes into staging buffer. Sets update_ready for callback to pick up.
+    // Writes into staging buffer. Sets active_pickup_idx for callback to pick up.
     void compute_pickup_weights(const Mesh& mesh, const ModeData& modes) {
         int J = mesh.vertices.size();
         if (J == 0) return;
@@ -358,94 +366,75 @@ public:
         int n_modes = modes.eigenvalues.size();
         if (n_modes > MAX_MODES) n_modes = MAX_MODES;
         
-        CoeffSet& stg = coeff[2]; // Target staging buffer
+        int active = active_pickup_idx.load(std::memory_order_acquire);
+        int next = 1 - active;
+
         for (int n = 0; n < n_modes; ++n) {
-            stg.pickup_psi[n] = (float)modes.eigenvectors(closest, n);
+            pickup_psi_buffers[next][n] = (float)modes.eigenvectors(closest, n);
         }
         
-        // Signal the audio thread that coeff[2] has been updated
-        update_ready.store(true, std::memory_order_release);
+        // Signal the audio thread that the new buffer is ready
+        active_pickup_idx.store(next, std::memory_order_release);
     }
 
     // ─── Compute radiation weights (call on tension/direction change) ────────
     // Writes into staging buffer. Sets update_ready for callback to pick up.
-    void build_coefficients(const ModeData& modes) {
-        // Mailbox now always overwrites staging buffer with the newest state
-        // to prevent dropping final slider updates.
-
-        int n_modes = modes.eigenvalues.size();
-        if (n_modes > MAX_MODES) n_modes = MAX_MODES;
-
-        double c = wave_speed();
+    void compute_coeffs_for_tension(double base_tension, const ModeData& modes, CoeffSet& out) {
+        double c = std::sqrt(std::max(base_tension, 0.1) / rho_s);
         const double dt = 1.0 / 44100.0;
-        const double nyquist_limit = 0.45 * 44100.0;  // Nyquist guard
+        const double nyquist = 0.45 * 44100.0;
         int J = MU.rows();
-
-        CoeffSet& stg = coeff[2];  // Staging is ALWAYS coeff[2]
+        int n_modes = std::min((int)modes.eigenvalues.size(), MAX_MODES);
 
         for (int n = 0; n < n_modes; ++n) {
             double Lambda_n = modes.eigenvalues[n];
             double omega_n = c * std::sqrt(std::max(Lambda_n, 0.0));
             double freq_hz = omega_n / (2.0 * M_PI);
 
-            // Nyquist guard: mute modes that would alias
-            if (freq_hz > nyquist_limit) {
-                stg.E_re[n] = 0.0f; stg.E_im[n] = 0.0f;
-                stg.G_re[n] = 0.0f; stg.G_im[n] = 0.0f;
-                stg.s2_re[n] = 0.0f; stg.s2_im[n] = 0.0f;
-                stg.sB_re[n] = 0.0f; stg.sB_im[n] = 0.0f;
-                stg.Phi_re[n] = 0.0f; stg.Phi_im[n] = 0.0f;
+            // Nyquist guard
+            if (freq_hz > nyquist) {
+                out.E_re[n] = out.E_im[n] = 0.f;
+                out.G_re[n] = out.G_im[n] = 0.f;
+                out.s2_re[n] = out.s2_im[n] = 0.f;
+                out.sB_re[n] = out.sB_im[n] = 0.f;
+                out.Phi_re[n] = out.Phi_im[n] = 0.f;
+                out.s_re[n] = out.s_im[n] = 0.f;
                 continue;
             }
 
-            // Compute radiative participation (I_vol)
-            double I_vol = 0.0;
-            for (int j = 0; j < J; ++j) {
-                I_vol += MU(j, n);
-            }
-            modal_air_participation[n] = (float)I_vol;
-
-            // Damping (clamped to underdamped regime)
+            // Damping – use existing build_mode_damping
             double d_n = build_mode_damping(n, omega_n, freq_hz);
             d_n = std::min(d_n, 0.95 * omega_n);
-            
-            // Store raw physical constants for real-time modulation queries
-            stg.omega[n] = (float)omega_n;
-            stg.damping[n] = (float)d_n;
 
-            // s_n = -d_n + i·ω_n
-            stg.s_re[n] = (float)(-d_n);
-            stg.s_im[n] = (float)(omega_n);
+            out.omega[n] = (float)omega_n;
+            out.damping[n] = (float)d_n;
 
-            // s_n² = (d_n² - ω_n²) + i·(-2·d_n·ω_n)
-            stg.s2_re[n] = (float)(d_n * d_n - omega_n * omega_n);
-            stg.s2_im[n] = (float)(-2.0 * d_n * omega_n);
+            // s = -d + iω
+            out.s_re[n] = (float)(-d_n);
+            out.s_im[n] = (float)(omega_n);
+
+            // s²
+            out.s2_re[n] = (float)(d_n * d_n - omega_n * omega_n);
+            out.s2_im[n] = (float)(-2.0 * d_n * omega_n);
 
             // E = exp(s·dt)
             double exp_decay = std::exp(-d_n * dt);
-            stg.E_re[n] = (float)(exp_decay * std::cos(omega_n * dt));
-            stg.E_im[n] = (float)(exp_decay * std::sin(omega_n * dt));
+            out.E_re[n] = (float)(exp_decay * std::cos(omega_n * dt));
+            out.E_im[n] = (float)(exp_decay * std::sin(omega_n * dt));
 
-            // G = ((E-1)/s) · norm
-            // norm = 1/(s - s*) = 1/(2·i·ω_n)
+            // G and sB
             std::complex<double> s_n(-d_n, omega_n);
-            std::complex<double> E_n(stg.E_re[n], stg.E_im[n]);
+            std::complex<double> E_n(out.E_re[n], out.E_im[n]);
             std::complex<double> norm = 1.0 / (s_n - std::conj(s_n));
-            std::complex<double> G_base = 0.0;
-            if (std::abs(s_n) > 1e-12) {
-                G_base = ((E_n - 1.0) / s_n) * norm;
-            } else {
-                G_base = dt * norm;
-            }
-            stg.G_re[n] = (float)G_base.real();
-            stg.G_im[n] = (float)G_base.imag();
+            std::complex<double> G_base = (std::abs(s_n) > 1e-12) ? ((E_n - 1.0) / s_n) * norm : dt * norm;
+            out.G_re[n] = (float)G_base.real();
+            out.G_im[n] = (float)G_base.imag();
 
-            // Forcing correction s·B = s·norm = s / (s - s*)
             std::complex<double> sB = s_n * norm;
-            stg.sB_re[n] = (float)sB.real();
-            stg.sB_im[n] = (float)sB.imag();
+            out.sB_re[n] = (float)sB.real();
+            out.sB_im[n] = (float)sB.imag();
 
-            // Radiation weight: Φ_n = Σ_j MU(j,n) · exp(i·k_n·ξ_j)
+            // Radiation weight Φ
             double k_n = omega_n / c_air;
             double phi_re = 0.0, phi_im = 0.0;
             for (int j = 0; j < J; ++j) {
@@ -456,12 +445,39 @@ public:
                 phi_re += mu_jn * cos_a;
                 phi_im += mu_jn * sin_a;
             }
-            stg.Phi_re[n] = (float)phi_re;
-            stg.Phi_im[n] = (float)phi_im;
+            out.Phi_re[n] = (float)phi_re;
+            out.Phi_im[n] = (float)phi_im;
+        }
+    }
+
+    void rebuild_tension_grid(const Mesh& mesh, const ModeData& modes) {
+        int J = mesh.vertices.size();
+        if (J == 0) return;
+
+        // Populate modal participations (requires MU, precomputed in precompute_MU)
+        int n_modes = std::min((int)modes.eigenvalues.size(), MAX_MODES);
+        for (int n = 0; n < n_modes; ++n) {
+            double I_vol = 0.0;
+            for (int j = 0; j < J; ++j) {
+                I_vol += MU(j, n);
+            }
+            modal_air_participation[n] = (float)I_vol;
         }
 
-        // Publish: signal callback that new coefficients are available
-        update_ready.store(true, std::memory_order_release);
+        // Get the inactive buffer index
+        int active = active_tension_grid.load(std::memory_order_acquire);
+        int next = 1 - active;
+
+        // Build a CoeffSet for each tension multiplier
+        for (int j = 0; j < TENSION_GRID_SIZE; ++j) {
+            double grid_tension = tension * TENSION_GRID_VALS[j];
+            compute_coeffs_for_tension(grid_tension, modes, tension_coeffs[next][j]);
+            
+            // Note: phi_pickup could also be populated here if it were tension-dependent.
+            // Since pickup_psi is tension-independent, it is handled separately.
+        }
+
+        active_tension_grid.store(next, std::memory_order_release);
     }
 
     // ─── Compute Biquad Filter Coefficients (called on UI param change) ─────
@@ -667,7 +683,7 @@ public:
     void rebuild_physical_coeffs(const Mesh& mesh, const ModeData& modes) {
         compute_mode_descriptors(mesh, modes);
         compute_xi(mesh);
-        build_coefficients(modes);
+        rebuild_tension_grid(mesh, modes);
     }
 
     // ─── Strike (called from UI thread) ─────────────────────────────────────
@@ -688,7 +704,7 @@ public:
         // This is explicitly done per-strike so that tuning changes do not pop the ongoing acoustic ring.
         shell_bank.count = std::min(4, modes_state.count);
         for (int k = 0; k < shell_bank.count; ++k) {
-            float om = coeff[2].omega[k];
+            float om = tension_coeffs[active_tension_grid.load(std::memory_order_acquire)][BASE_TENSION_IDX].omega[k];
             float gain = 1.0f - (k * 0.2f); 
             float damp = 0.05f - (k * 0.01f);
             
@@ -749,20 +765,10 @@ public:
         const float alpha_step = 1.0f / (FADE_DURATION_S * 44100.0f);
 
         // --- Snapshot indices once per block ---
-        int ci = engine->cur_idx.load(std::memory_order_acquire);
-        int fi = engine->fade_idx.load(std::memory_order_relaxed);
-
-        // --- Check for new coefficient update (once per block) ---
-        if (engine->update_ready.load(std::memory_order_acquire)) {
-            // Copy staging (coeff[2]) into fade target buffer
-            std::memcpy(&engine->coeff[fi], &engine->coeff[2], sizeof(CoeffSet));
-            engine->update_ready.store(false, std::memory_order_release);
-            engine->fading = true;
-            engine->fade_alpha = 0.0f;
-        }
-
-        const CoeffSet& cur_coeff = engine->coeff[ci];
-        const CoeffSet& fade_coeff = engine->coeff[fi];
+        int ci = engine->active_tension_grid.load(std::memory_order_acquire);
+        int pi_idx = engine->active_pickup_idx.load(std::memory_order_acquire);
+        auto& grid = engine->tension_coeffs[ci];
+        auto& pickup = engine->pickup_psi_buffers[pi_idx];
 
         // --- Check for new filter update (once per block) ---
         int filter_ci = engine->cur_filter_idx.load(std::memory_order_acquire);
@@ -790,6 +796,51 @@ public:
         for (int i = 0; i < samples; ++i) {
             double sample = 0.0;
 
+            // --- Compute Total Modale Energy (E = w^2 * z^2 + v^2) ---
+            float current_energy = 0.0f;
+            for (int m = 0; m < engine->modes_state.count; ++m) {
+                if (engine->modes_state.active[m]) {
+                    float zr = engine->modes_state.Z_re[m];
+                    float zi = engine->modes_state.Z_im[m];
+                    // omega from the base tension grid
+                    float om = grid[BASE_TENSION_IDX].omega[m];
+                    float z_mag2 = zr*zr + zi*zi;
+                    // approx modal energy ~ omega^2 * |Z|^2  (since Z is scaled phasor)
+                    current_energy += z_mag2 * om * om; 
+                }
+            }
+            
+            // Exponential smoothing to avoid audio-rate zipper noise on the pitch drop
+            engine->energy_smooth = engine->energy_smooth + engine->energy_alpha * (current_energy - engine->energy_smooth);
+
+            // --- Map Smoothed Energy to Tension Multiplier ---
+            // Base multiplier is 1.0. Adds (nonlinearity * energy)
+            float tension_mult = 1.0f + engine->nonlinearity * engine->energy_smooth;
+            
+            // Clamp to our precomputed grid bounds
+            float min_mult = TENSION_GRID_VALS[0];
+            float max_mult = TENSION_GRID_VALS[TENSION_GRID_SIZE - 1];
+            if (tension_mult < min_mult) tension_mult = min_mult;
+            if (tension_mult > max_mult) tension_mult = max_mult;
+
+            // --- Find Grid Indices for Interpolation ---
+            int idx_low = 0;
+            int idx_high = 1;
+            for (int g = 0; g < TENSION_GRID_SIZE - 1; ++g) {
+                if (tension_mult >= TENSION_GRID_VALS[g] && tension_mult <= TENSION_GRID_VALS[g + 1]) {
+                    idx_low = g;
+                    idx_high = g + 1;
+                    break;
+                }
+            }
+
+            float val_low = TENSION_GRID_VALS[idx_low];
+            float val_high = TENSION_GRID_VALS[idx_high];
+            float t = (tension_mult - val_low) / (val_high - val_low);
+
+            const CoeffSet& low = grid[idx_low];
+            const CoeffSet& high = grid[idx_high];
+
             // ─── Determine per-sample forcing ────────────────────────────
             float Fc = 0.0f;  // Contact force (used only in contact model)
             float f_t_f = 0.0f; // Old bump force (used only in prescribed bump)
@@ -808,8 +859,11 @@ public:
                         // q_n ≈ 2·Re(Z_n)
                         w_contact += 2.0 * (double)(zr * psi);
                         // q_dot_n ≈ 2·Re(s_n · Z_n)
-                        float sr = cur_coeff.s_re[m];
-                        float si = cur_coeff.s_im[m];
+                        
+                        // Interpolate s for velocity
+                        float sr = (1-t) * low.s_re[m] + t * high.s_re[m];
+                        float si = (1-t) * low.s_im[m] + t * high.s_im[m];
+                        
                         float sZ_re = sr * zr - si * zi;
                         w_contact_vel += 2.0 * (double)(sZ_re * psi);
                     }
@@ -865,42 +919,48 @@ public:
                     forcing = engine->modes_state.strike_scale[m] * f_t_f;
                 }
 
+                // Interpolate E and G
+                float E_re = (1-t) * low.E_re[m] + t * high.E_re[m];
+                float E_im = (1-t) * low.E_im[m] + t * high.E_im[m];
+                float G_re = (1-t) * low.G_re[m] + t * high.G_re[m];
+                float G_im = (1-t) * low.G_im[m] + t * high.G_im[m];
+
                 // Evolution: Z' = E·Z + G·forcing
-                float next_zr = (zr * cur_coeff.E_re[m] - zi * cur_coeff.E_im[m]) + cur_coeff.G_re[m] * forcing;
-                float next_zi = (zr * cur_coeff.E_im[m] + zi * cur_coeff.E_re[m]) + cur_coeff.G_im[m] * forcing;
+                float next_zr = (zr * E_re - zi * E_im) + G_re * forcing;
+                float next_zi = (zr * E_im + zi * E_re) + G_im * forcing;
 
                 engine->modes_state.Z_re[m] = next_zr;
                 engine->modes_state.Z_im[m] = next_zi;
 
                 // ---- Pickup Extraction (Displacement and Velocity) ----
-                float psi = cur_coeff.pickup_psi[m];
+                float psi = pickup[m];
                 float disp_n = 2.0f * next_zr;
-                float vel_n  = 2.0f * (cur_coeff.s_re[m] * next_zr - cur_coeff.s_im[m] * next_zi);
+                
+                float s_re = (1-t) * low.s_re[m] + t * high.s_re[m];
+                float s_im = (1-t) * low.s_im[m] + t * high.s_im[m];
+                float vel_n  = 2.0f * (s_re * next_zr - s_im * next_zi);
                 
                 sum_disp += disp_n * psi;
                 sum_vel  += vel_n * psi;
 
                 // ---- Far-Field Extraction (Acceleration) ----
                 // Acceleration: a = s²·Z
-                float ar = cur_coeff.s2_re[m] * next_zr - cur_coeff.s2_im[m] * next_zi;
-                float ai = cur_coeff.s2_re[m] * next_zi + cur_coeff.s2_im[m] * next_zr;
+                float s2_re = (1-t) * low.s2_re[m] + t * high.s2_re[m];
+                float s2_im = (1-t) * low.s2_im[m] + t * high.s2_im[m];
+                float ar = s2_re * next_zr - s2_im * next_zi;
+                float ai = s2_re * next_zi + s2_im * next_zr;
 
                 // Forcing correction during active forcing window
                 if (forcing != 0.0f) {
-                    ar += cur_coeff.sB_re[m] * forcing;
-                    ai += cur_coeff.sB_im[m] * forcing;
+                    float sB_re = (1-t) * low.sB_re[m] + t * high.sB_re[m];
+                    float sB_im = (1-t) * low.sB_im[m] + t * high.sB_im[m];
+                    ar += sB_re * forcing;
+                    ai += sB_im * forcing;
                 }
 
-                // Output: crossfade Phi ONLY (radiation mapping)
-                float pr, pi;
-                if (engine->fading) {
-                    float alpha = engine->fade_alpha;
-                    pr = (1.0f - alpha) * cur_coeff.Phi_re[m] + alpha * fade_coeff.Phi_re[m];
-                    pi = (1.0f - alpha) * cur_coeff.Phi_im[m] + alpha * fade_coeff.Phi_im[m];
-                } else {
-                    pr = cur_coeff.Phi_re[m];
-                    pi = cur_coeff.Phi_im[m];
-                }
+                // Radiation mapping
+                float pr = (1-t) * low.Phi_re[m] + t * high.Phi_re[m];
+                float pi = (1-t) * low.Phi_im[m] + t * high.Phi_im[m];
 
                 // sum_radiation = Σ 2·Re(conj(Φ)·a)
                 sum_radiation += 2.0 * (pr * ar + pi * ai);
@@ -920,15 +980,6 @@ public:
             sample = (engine->mix_disp * sum_disp) 
                    + (engine->mix_vel * sum_vel) 
                    + (engine->mix_accel * sum_radiation);
-
-            // Advance crossfade alpha
-            if (engine->fading) {
-                engine->fade_alpha += alpha_step;
-            }
-
-            // Physical scaling: ρ₀/(2πr) where ρ₀=1.225 kg/m³, r=1m
-            // This line is now handled inside update_modal_bank for the radiation term
-            // sample *= engine->rho_air / (2.0 * M_PI * engine->listener_distance);
 
             // --- Apply Shell Processing (A/B testing block) ---
             if (engine->phys.use_shell_bank) {
@@ -963,14 +1014,8 @@ public:
         }
 
         // --- Commit fade at block boundary ---
-        if (engine->fading && engine->fade_alpha >= 1.0f) {
-            // Fade complete: swap cur and fade (both always in {0,1})
-            engine->cur_idx.store(fi, std::memory_order_release);
-            engine->fade_idx.store(ci, std::memory_order_relaxed);
-            // Now: cur=fi, fade=ci (old cur becomes new fade target for next update)
-            engine->fading = false;
-            engine->fade_alpha = 0.0f;
-        }
+        // Fading logic for tension coefficients (cur_idx, fade_idx, update_ready) has been removed
+        // and replaced by interpolated double-buffering via active_tension_grid.
 
         // --- Commit filter fade at block boundary ---
         if (engine->fading_filter && engine->fade_filter_alpha >= 1.0f) {
