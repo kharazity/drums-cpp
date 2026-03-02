@@ -1,16 +1,31 @@
-# Drums C++
+# Drums++
 
-Real-time interactive drum membrane simulator with GUI, built with SDL2, ImGui, and Eigen.
+Real-time interactive drum membrane simulator with GUI
 
-![Drums C++ GUI](docs/screenshot.png)
+![Drums++ GUI](docs/screenshot.png)
 
 ## Overview
 
-This project simulates the sound of striking a 2D membrane of arbitrary shape in real-time. It uses:
-1. **Constrained Delaunay Triangulation (CDT)** to mesh arbitrary shapes, including shapes with holes.
-2. **Finite Element Method (FEM)** to assemble the stiffness and mass matrices.
-3. **Spectra** to solve the generalized eigenvalue problem, extracting the natural frequencies and mode shapes.
-4. **Exact Phasor Integration** to synthesize the drum sound accurately without numerical dispersion.
+Can you [hear the shape of a drum](https://en.wikipedia.org/wiki/Hearing_the_shape_of_a_drum)? Turns out the answer is [no](https://en.wikipedia.org/wiki/Hearing_the_shape_of_a_drum#The_answer). 
+However, even though you can't uniquely determine a shape by the eigenvalues of the boundary value problem for the Laplacian, there's nothing to stop us from trying to play drums of odd construction.
+The goal of this project is to answer a different question: how does that drum sound?
+
+
+Unfortunately simulating the "real" physics of a drum is quite an intensive task, and falls within the family of techniques called [physical modeling synthesis](https://en.wikipedia.org/wiki/Physical_modelling_synthesis).
+Our work falls squarely in the family of methods called ["modal synthesis"](https://ccrma.stanford.edu/~bilbao/booktop/node14.html). However, what we lack in realism we make up for with a real-time 
+interactive GUI. 
+
+Nevertheless, we include some ad-hoc corrections to the base modal synthesis structure to approximate "realism". These include:
+
+1. **Linear and non-linear damping** Control the rate and power-law decay of frequncies as $a_0 + a_1\omega^\beta$
+2. **Air and Edge loss** Control the rate of decay of modes propagating through the error or close to the edges of drum boundary
+3. **Striker physics** Control the mass, stiffness, width, and hardness of a drumstick striking the drum
+4. **Pitch glide** Approximate non-linear effects in the membrane tensioning 
+5. **Pickup controls** Control the location of a listener, the contributions of the displacement, velocity, and acceleration of the pressure wave to the pickup sound
+6. **More improvements to come**
+
+So, if you ever wondered to yourself: "what a drum shaped like *that* would sound like?"
+if you tune the parameters just right, you might be able to get like an 80% fidelity answer to that question. 
 
 ## System Dependencies
 

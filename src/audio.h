@@ -133,20 +133,21 @@ struct BiquadState {
 
 // ─── Physical Model Parameters (toggle flags + striker constants) ────────────
 struct PhysicalModelParams {
-    bool use_contact_model = false;
-    bool use_mode_dependent_damping = false;
-    bool use_shell_bank = false;
+    // All three physics subsystems enabled by default to match GUI initial state
+    bool use_contact_model = true;
+    bool use_mode_dependent_damping = true;
+    bool use_shell_bank = true;
 
-    // Striker / contact
-    double striker_mass = 0.02;          // kg
-    double striker_stiffness = 5e5;      // K
-    double striker_damping = 10.0;       // R (contact damping)
-    double striker_exponent = 1.5;       // p (Hertz power-law exponent)
-    double striker_initial_velocity = 1.0; // m/s
+    // Striker / contact — matches "Stick" preset at 0.5 hardness by default
+    double striker_mass = 0.015;         // kg  (Stick mass)
+    double striker_stiffness = 3e5;      // K   (Stick: K_lo=1e5, K_hi=5e5, t=0.5)
+    double striker_damping = 12.5;       // R   (Stick: R_lo=5, R_hi=20, t=0.5)
+    double striker_exponent = 2.0;       // p   (Stick exponent)
+    double striker_initial_velocity = 5.0; // m/s (matches hit strength default of 5.0)
 
-    // Damping (Milestone 2)
-    double edge_loss_weight = 0.0;
-    double air_loss_weight = 1.0;
+    // Damping (Milestone 2) — matches damping_macro=0.5 defaults
+    double edge_loss_weight = 25.0;      // 0.0 + 0.5 * 50.0
+    double air_loss_weight = 1.75;       // 0.5 + 0.5 * 2.5
 
     // Shell Bank (Milestone 3)
     int shell_mode_count = 4;
@@ -204,11 +205,11 @@ public:
     // ─── Physical Constants ─────────────────────────────────────────────────
     double tension   = 200.0;       // T (N/m)
     double rho_s     = 0.26;        // Surface density (kg/m²)
-    double alpha0    = 5.0;         // Frequency-independent damping (1/s)
+    double alpha0    = 10.25;       // Freq-independent damping — matches damping_macro=0.5: 0.5 + 0.5*19.5
     double alpha1    = 0.01;        // Frequency-proportional damping coefficient
     double beta      = 1.0;         // Frequency damping power law exponent
-    double strike_v0 = 1.0;         // Strike velocity (m/s)
-    double strike_width_delta = 0.05; // Spatial mallet strike width (m)
+    double strike_v0 = 5.0;         // Strike velocity (m/s) — matches hit_strength default of 5.0
+    double strike_width_delta = 0.01; // Spatial mallet width — matches Stick preset
     double strike_duration_ms = 5.0;  // Temporal strike duration (ms)
 
     // ─── Physical Model Params & Striker ────────────────────────────────────
@@ -221,7 +222,7 @@ public:
     double c_air = 343.0;           // Speed of sound in air (m/s)
     double rho_air = 1.225;         // Air density (kg/m³)
     double listener_distance = 1.0; // Far-field distance (m) — affects amplitude only
-    double listener_elevation = 90.0; // Degrees (90° = directly overhead)
+    double listener_elevation = 60.0; // Degrees — matches "Player" mic preset
     double listener_azimuth   = 0.0;  // Degrees
     double master_volume = 10.0;    // User-adjustable master volume
     
@@ -234,7 +235,7 @@ public:
     double mix_disp  = 0.10;        // Displacement mix ratio
 
     // ─── Stochastic Frequency Detuning ──────────────────────────────────────
-    double detune_amount = 0.005;   // Base detuning amount (e.g., 0.005 for 0.5%)
+    double detune_amount = 0.005;   // Base detuning amount — matches GUI Detuning slider default
     std::vector<double> mode_detune_factors; // Per-mode uniformly distributed [-1, 1]
 
     // ─── Shell Resonance Filter Parameters ──────────────────────────────────
