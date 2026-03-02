@@ -18,7 +18,7 @@ interactive GUI.
 Nevertheless, we include some ad-hoc corrections to the base modal synthesis structure to approximate "realism". These include:
 
 1. **Linear and non-linear damping** Control the rate and power-law decay of frequncies as $a_0 + a_1\omega^\beta$
-2. **Air and Edge loss** Control the rate of decay of modes propagating through the error or close to the edges of drum boundary
+2. **Air and Edge loss** Control the rate of decay of modes propagating through the air or close to the edges of drum boundary
 3. **Striker physics** Control the mass, stiffness, width, and hardness of a drumstick striking the drum
 4. **Pitch glide** Approximate non-linear effects in the membrane tensioning 
 5. **Pickup controls** Control the location of a listener, the contributions of the displacement, velocity, and acceleration of the pressure wave to the pickup sound
