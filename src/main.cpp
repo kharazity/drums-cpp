@@ -30,20 +30,10 @@ int main(int argc, char* argv[]) {
     std::vector<ModeData> all_modes;
     AudioEngine audio;
     
-    // Initial Setup
-    meshes.push_back(Mesh());
-    meshes[0].generate_regular_polygon(4, 1.0, 20);
-    fems.push_back(FEM());
-    fems[0].assemble(meshes[0]);
-    all_modes.push_back(Solver::solve(fems[0], 60));
-    audio.precompute_MU(fems[0], all_modes[0]);
-    audio.compute_pickup_weights(meshes[0], all_modes[0]);
-    audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
-    
     // Visualization State
     float zoom = 300.0f;
-    int n_modes = 60;
-    int mesh_density = 20;
+    int n_modes = 100;
+    int mesh_density = 40;
     
     // Drawing State
     enum ShapeType { REGULAR_POLYGON, ELLIPSE, ISOSPECTRAL, CUSTOM, ANNULUS };
@@ -68,6 +58,16 @@ int main(int argc, char* argv[]) {
     std::vector<HoleDef> shape_holes;
     float new_hole_a = 0.15f;  // default hole size
     float new_hole_b = 0.15f;
+
+    // Initial Setup
+    meshes.push_back(Mesh());
+    meshes[0].generate_regular_polygon(polygon_n, polygon_L, mesh_density);
+    fems.push_back(FEM());
+    fems[0].assemble(meshes[0]);
+    all_modes.push_back(Solver::solve(fems[0], n_modes));
+    audio.precompute_MU(fems[0], all_modes[0]);
+    audio.compute_pickup_weights(meshes[0], all_modes[0]);
+    audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
     
     // Shape Control Points (for interactive editing in play mode)
     std::vector<Vertex> shape_control_points;
@@ -205,10 +205,10 @@ int main(int argc, char* argv[]) {
         double mass, K_lo, K_hi, R_lo, R_hi, exponent, width;
     };
     static const BeaterPreset BEATER_PRESETS[] = {
-        {"Stick",       0.015, 5e5, 2e6, 5.0, 20.0, 2.0, 0.01},
-        {"Hard Mallet", 0.04,  2e5, 1e6, 10.0, 40.0, 1.5, 0.03},
-        {"Soft Mallet", 0.06,  5e4, 3e5, 20.0, 80.0, 1.5, 0.08},
-        {"Finger",      0.02,  1e4, 8e4, 30.0, 100.0, 1.2, 0.15},
+        {"Stick",       0.015, 1e5, 5e5, 5.0, 20.0, 2.0, 0.01},
+        {"Hard Mallet", 0.04,  5e4, 2e5, 10.0, 40.0, 1.5, 0.03},
+        {"Soft Mallet", 0.06,  1e4, 5e4, 20.0, 80.0, 1.5, 0.08},
+        {"Finger",      0.02,  5e3, 2e4, 30.0, 100.0, 1.2, 0.15},
     };
     int current_beater_idx = 0;
     float current_beater_hardness = 0.5f;
@@ -402,7 +402,7 @@ int main(int argc, char* argv[]) {
                         if (!fems.empty() && !all_modes.empty()) {
                             audio.precompute_MU(fems[0], all_modes[0]);
                             audio.compute_pickup_weights(meshes[0], all_modes[0]);
-                            audio.rebuild_tension_grid(meshes[0], all_modes[0]);
+                            audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
                         }
                         
                         freqs.clear();
@@ -604,7 +604,7 @@ int main(int argc, char* argv[]) {
 
                                     audio.precompute_MU(fems[0], all_modes[0]);
                                     audio.compute_pickup_weights(meshes[0], all_modes[0]);
-                                    audio.rebuild_tension_grid(meshes[0], all_modes[0]);
+                                    audio.rebuild_physical_coeffs(meshes[0], all_modes[0]);
 
                                     freqs.clear();
                                     {
@@ -641,6 +641,14 @@ int main(int argc, char* argv[]) {
                     if (ImGui::SliderFloat("Pitch Glide (Energy)", &nonlin_f, 0.0f, 10.0f, "%.2f")) {
                         audio.nonlinearity = (double)nonlin_f;
                     }
+                    
+                    float detune_f = (float)audio.detune_amount;
+                    if (ImGui::SliderFloat("Detuning Amount", &detune_f, 0.0f, 0.05f, "%.4f")) {
+                        audio.detune_amount = (double)detune_f;
+                        if (!meshes.empty() && !all_modes.empty()) {
+                            audio.rebuild_tension_grid(meshes[0], all_modes[0]);
+                        }
+                    }
 
                     // Optional smoothing time (in ms)
                      float smoothing_ms = 1000.0f * (1.0f - std::pow(1.0f - audio.energy_alpha, 44100.0f));
@@ -658,12 +666,15 @@ int main(int argc, char* argv[]) {
                     ImGui::Text("Pickup Sensor Position");
                     float px = (float)audio.pickup_x;
                     float py = (float)audio.pickup_y;
+                    float pr = (float)audio.pickup_radius;
                     bool pos_changed = false;
                     pos_changed |= ImGui::SliderFloat("Pickup X (m)", &px, -0.5f, 0.5f, "%.3f");
                     pos_changed |= ImGui::SliderFloat("Pickup Y (m)", &py, -0.5f, 0.5f, "%.3f");
+                    pos_changed |= ImGui::SliderFloat("Pickup Radius (m)", &pr, 0.001f, 0.2f, "%.3f");
                     if (pos_changed) {
                         audio.pickup_x = (double)px;
                         audio.pickup_y = (double)py;
+                        audio.pickup_radius = (double)pr;
                         if (!meshes.empty() && !all_modes.empty()) {
                             audio.compute_pickup_weights(meshes[0], all_modes[0]);
                         }
@@ -681,7 +692,14 @@ int main(int argc, char* argv[]) {
                         float sp_f = (float)audio.phys.striker_exponent;
                         if (ImGui::SliderFloat("Exponent (p)", &sp_f, 1.0f, 3.0f, "%.2f")) audio.phys.striker_exponent = (double)sp_f;
                         float sw_f = (float)audio.strike_width_delta;
-                        if (ImGui::SliderFloat("Mallet Width", &sw_f, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)) audio.strike_width_delta = (double)sw_f;
+                        if (ImGui::SliderFloat("Mallet Width (m)", &sw_f, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)) audio.strike_width_delta = (double)sw_f;
+                    } else {
+                        ImGui::Separator();
+                        ImGui::Text("Prescribed Bump Model");
+                        float sm_f = (float)audio.strike_duration_ms;
+                        if (ImGui::SliderFloat("Bump Duration (ms)", &sm_f, 1.0f, 50.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) audio.strike_duration_ms = (double)sm_f;
+                        float sw_f = (float)audio.strike_width_delta;
+                        if (ImGui::SliderFloat("Bump Width (m)", &sw_f, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic)) audio.strike_width_delta = (double)sw_f;
                     }
 
                     ImGui::Separator();

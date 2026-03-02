@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <complex>
+#include <random>
 #include <SDL.h>
 #include "solver.h" // For ModeData
 #include "fem.h"    // For FEM (mass matrix)
@@ -208,6 +209,7 @@ public:
     double beta      = 1.0;         // Frequency damping power law exponent
     double strike_v0 = 1.0;         // Strike velocity (m/s)
     double strike_width_delta = 0.05; // Spatial mallet strike width (m)
+    double strike_duration_ms = 5.0;  // Temporal strike duration (ms)
 
     // ─── Physical Model Params & Striker ────────────────────────────────────
     PhysicalModelParams phys;
@@ -226,9 +228,14 @@ public:
     // ─── Pickup Mix Parameters (Displacement, Velocity, Acceleration) ───────
     double pickup_x = 0.0;          // Pickup coordinate X
     double pickup_y = 0.0;          // Pickup coordinate Y
+    double pickup_radius = 0.02;    // Pickup radius for area-weighted sampling
     double mix_vel  = 0.65;         // Velocity mix ratio
     double mix_accel = 0.25;        // Far-field acceleration mix ratio
     double mix_disp  = 0.10;        // Displacement mix ratio
+
+    // ─── Stochastic Frequency Detuning ──────────────────────────────────────
+    double detune_amount = 0.005;   // Base detuning amount (e.g., 0.005 for 0.5%)
+    std::vector<double> mode_detune_factors; // Per-mode uniformly distributed [-1, 1]
 
     // ─── Shell Resonance Filter Parameters ──────────────────────────────────
     double shell_freq = 200.0;      // Resonance Frequency (Hz) (Old Biquad)
@@ -321,6 +328,14 @@ public:
                 MU.col(n) *= s;
             }
         }
+
+        // Generate reproducible stochastic mode detuning factors
+        mode_detune_factors.resize(n_modes);
+        std::mt19937 gen(42); // Fixed seed for reproducibility when rebuilding
+        std::uniform_real_distribution<double> dist(-1.0, 1.0);
+        for (int n = 0; n < n_modes; ++n) {
+            mode_detune_factors[n] = dist(gen);
+        }
     }
 
     // ─── Compute ξ_j (call on init and direction change) ────────────────────
@@ -352,25 +367,64 @@ public:
         int J = mesh.vertices.size();
         if (J == 0) return;
 
-        // 1. Find the closest vertex to (pickup_x, pickup_y)
-        double min_r = 1e9;
-        int closest = 0;
-        for (int j = 0; j < J; ++j) {
-            double dx = mesh.vertices[j].x - pickup_x;
-            double dy = mesh.vertices[j].y - pickup_y;
-            double r = dx*dx + dy*dy;
-            if (r < min_r) { min_r = r; closest = j; }
-        }
-
-        // 2. Sample eigenvectors at the pickup location
         int n_modes = modes.eigenvalues.size();
         if (n_modes > MAX_MODES) n_modes = MAX_MODES;
         
         int active = active_pickup_idx.load(std::memory_order_acquire);
         int next = 1 - active;
 
+        // 1. Compute nodal areas (1/3 of adjacent triangle areas)
+        std::vector<double> nodal_area(J, 0.0);
+        for (const auto& tri : mesh.elements) {
+            double x1 = mesh.vertices[tri.v[0]].x, y1 = mesh.vertices[tri.v[0]].y;
+            double x2 = mesh.vertices[tri.v[1]].x, y2 = mesh.vertices[tri.v[1]].y;
+            double x3 = mesh.vertices[tri.v[2]].x, y3 = mesh.vertices[tri.v[2]].y;
+            double area = 0.5 * std::abs(x1*(y2 - y3) + x2*(y3 - y1) + x3*(y1 - y2));
+            double node_weight = area / 3.0;
+            nodal_area[tri.v[0]] += node_weight;
+            nodal_area[tri.v[1]] += node_weight;
+            nodal_area[tri.v[2]] += node_weight;
+        }
+
+        // 2. Find vertices within pickup_radius and compute total area
+        double total_area = 0.0;
+        std::vector<int> active_nodes;
+        
+        for (int j = 0; j < J; ++j) {
+            double dx = mesh.vertices[j].x - pickup_x;
+            double dy = mesh.vertices[j].y - pickup_y;
+            double r = std::sqrt(dx*dx + dy*dy);
+            if (r <= pickup_radius) {
+                total_area += nodal_area[j];
+                active_nodes.push_back(j);
+            }
+        }
+
+        // Fallback to closest vertex if none found within radius
+        if (active_nodes.empty()) {
+            double min_r = 1e9;
+            int closest = 0;
+            for (int j = 0; j < J; ++j) {
+                double dx = mesh.vertices[j].x - pickup_x;
+                double dy = mesh.vertices[j].y - pickup_y;
+                double r = dx*dx + dy*dy;
+                if (r < min_r) { min_r = r; closest = j; }
+            }
+            active_nodes.push_back(closest);
+            total_area = nodal_area[closest];
+        }
+
+        // 3. Compute area-weighted average for each mode
         for (int n = 0; n < n_modes; ++n) {
-            pickup_psi_buffers[next][n] = (float)modes.eigenvectors(closest, n);
+            double weighted_sum = 0.0;
+            for (int j : active_nodes) {
+                weighted_sum += modes.eigenvectors(j, n) * nodal_area[j];
+            }
+            if (total_area > 0.0) {
+                pickup_psi_buffers[next][n] = (float)(weighted_sum / total_area);
+            } else {
+                pickup_psi_buffers[next][n] = 0.0f;
+            }
         }
         
         // Signal the audio thread that the new buffer is ready
@@ -388,7 +442,12 @@ public:
 
         for (int n = 0; n < n_modes; ++n) {
             double Lambda_n = modes.eigenvalues[n];
-            double omega_n = c * std::sqrt(std::max(Lambda_n, 0.0));
+            // Apply per-mode stochastic frequency detuning
+            double detune_mult = 1.0;
+            if (n < (int)mode_detune_factors.size()) {
+                detune_mult += mode_detune_factors[n] * detune_amount;
+            }
+            double omega_n = c * std::sqrt(std::max(Lambda_n, 0.0)) * detune_mult;
             double freq_hz = omega_n / (2.0 * M_PI);
 
             // Nyquist guard
@@ -469,12 +528,15 @@ public:
         int next = 1 - active;
 
         // Build a CoeffSet for each tension multiplier
+        int current_pickup = active_pickup_idx.load(std::memory_order_acquire);
         for (int j = 0; j < TENSION_GRID_SIZE; ++j) {
             double grid_tension = tension * TENSION_GRID_VALS[j];
             compute_coeffs_for_tension(grid_tension, modes, tension_coeffs[next][j]);
             
-            // Note: phi_pickup could also be populated here if it were tension-dependent.
-            // Since pickup_psi is tension-independent, it is handled separately.
+            // Mirror current pickup weights into the tension grid
+            for (int n = 0; n < n_modes; ++n) {
+                tension_coeffs[next][j].pickup_psi[n] = pickup_psi_buffers[current_pickup][n];
+            }
         }
 
         active_tension_grid.store(next, std::memory_order_release);
@@ -732,7 +794,7 @@ public:
             }
         } else {
             // --- Old prescribed bump model ---
-            strike_duration_delta = 0.002 / std::max(strike_v0, 0.01);
+            strike_duration_delta = std::max(0.1, strike_duration_ms) / 1000.0;
             current_strike_time = -strike_duration_delta;
 
             double temporal_bump_integral = 0.4439938 * strike_duration_delta;
