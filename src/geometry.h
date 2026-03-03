@@ -6,8 +6,10 @@
 #include <iostream>
 #include <algorithm>
 #include <set>
+#include <cstring>
 #include <Eigen/Dense>
-#include <CDT.h>
+
+#include "triangle.h"
 
 struct Vertex {
     double x, y;
@@ -29,37 +31,9 @@ public:
         boundary_nodes.clear();
     }
 
-    // Generate Unit Square Mesh
+    // Square mesh: regular 4-gon with given side length and mesh density
     void generate_square(double size, int n_per_side) {
-        clear();
-        double half = size / 2.0;
-        double dx = size / n_per_side;
-
-        // Nodes
-        for (int j = 0; j <= n_per_side; ++j) {
-            for (int i = 0; i <= n_per_side; ++i) {
-                vertices.push_back({-half + i * dx, -half + j * dx});
-                
-                // Boundary check
-                if (i == 0 || i == n_per_side || j == 0 || j == n_per_side) {
-                    boundary_nodes.push_back(vertices.size() - 1);
-                }
-            }
-        }
-
-        // Elements
-        for (int j = 0; j < n_per_side; ++j) {
-            for (int i = 0; i < n_per_side; ++i) {
-                int n1 = j * (n_per_side + 1) + i;
-                int n2 = n1 + 1;
-                int n3 = (j + 1) * (n_per_side + 1) + i;
-                int n4 = n3 + 1;
-
-                // Two triangles per quad
-                elements.push_back({n1, n2, n3});
-                elements.push_back({n2, n4, n3});
-            }
-        }
+        generate_regular_polygon(4, size, n_per_side);
     }
 
     // ─── Point-in-polygon test (ray casting) ────────────────────────────────
@@ -78,147 +52,128 @@ public:
     }
 
     // ─── Generate mesh from arbitrary closed polygon (with optional holes) ──
+    // Uses Shewchuk's Triangle with quality refinement (min angle ~20°) and optional max area.
     void generate_from_polygon(const std::vector<Vertex>& boundary_poly,
                                const std::vector<std::vector<Vertex>>& holes = {},
                                int density = 15) {
         clear();
         if (boundary_poly.size() < 3) return;
 
-        int n_outer = (int)boundary_poly.size();
+        const int n_outer = (int)boundary_poly.size();
 
-        // 1. Compute bounding box from outer boundary
+        // Bounding box and scale for optional area constraint
         double min_x = 1e9, max_x = -1e9, min_y = 1e9, max_y = -1e9;
         for (const auto& v : boundary_poly) {
             min_x = std::min(min_x, v.x); max_x = std::max(max_x, v.x);
             min_y = std::min(min_y, v.y); max_y = std::max(max_y, v.y);
         }
-        double width = max_x - min_x;
-        double height = max_y - min_y;
-        double scale = std::max(width, height);
-        double step = scale / density;
-        double margin = step * 0.3;
+        double scale = std::max(max_x - min_x, max_y - min_y);
+        if (scale < 1e-10) scale = 1.0;
+        double max_area = (scale / (double)density) * (scale / (double)density) * 0.5;
 
-        // 2. Build all boundary edges for margin check
-        //    (outer boundary edges + all hole edges)
-        struct EdgeSeg { Vertex a, b; };
-        std::vector<EdgeSeg> all_boundary_edges;
-        // Outer edges
-        for (int i = 0; i < n_outer; ++i) {
-            int j = (i + 1) % n_outer;
-            all_boundary_edges.push_back({boundary_poly[i], boundary_poly[j]});
+        // Build point list: outer boundary then hole boundaries
+        std::vector<TRI_REAL> pointlist;
+        std::vector<int> pointmarkerlist;
+        for (const auto& v : boundary_poly) {
+            pointlist.push_back((TRI_REAL)v.x);
+            pointlist.push_back((TRI_REAL)v.y);
+            pointmarkerlist.push_back(1);
         }
-        // Hole edges
+        std::vector<int> hole_offsets;
         for (const auto& hole : holes) {
-            int nh = (int)hole.size();
-            for (int i = 0; i < nh; ++i) {
-                int j = (i + 1) % nh;
-                all_boundary_edges.push_back({hole[i], hole[j]});
+            hole_offsets.push_back((int)(pointlist.size() / 2));
+            for (const auto& v : hole) {
+                pointlist.push_back((TRI_REAL)v.x);
+                pointlist.push_back((TRI_REAL)v.y);
+                pointmarkerlist.push_back(1);
             }
         }
 
-        // 3. Add outer boundary vertices
+        // Segment list: outer loop then each hole loop (0-based indices)
+        std::vector<int> segmentlist;
         for (int i = 0; i < n_outer; ++i) {
-            vertices.push_back(boundary_poly[i]);
-            boundary_nodes.push_back(i);
+            segmentlist.push_back(i);
+            segmentlist.push_back((i + 1) % n_outer);
         }
-
-        // 4. Add hole boundary vertices (tracking per-hole offsets)
-        std::vector<int> hole_offsets;  // start index for each hole
-        for (const auto& hole : holes) {
-            int offset = (int)vertices.size();
-            hole_offsets.push_back(offset);
-            int nh = (int)hole.size();
-            for (int i = 0; i < nh; ++i) {
-                vertices.push_back(hole[i]);
-                boundary_nodes.push_back(offset + i);
-            }
-        }
-
-        // 5. Add interior grid points: inside outer, outside all holes,
-        //    and not too close to any boundary edge
-        for (double y = min_y + step * 0.5; y < max_y; y += step) {
-            for (double x = min_x + step * 0.5; x < max_x; x += step) {
-                if (!point_in_polygon(x, y, boundary_poly)) continue;
-
-                // Reject if inside any hole
-                bool in_hole = false;
-                for (const auto& hole : holes) {
-                    if (point_in_polygon(x, y, hole)) { in_hole = true; break; }
-                }
-                if (in_hole) continue;
-
-                // Reject if too close to any boundary/hole edge
-                bool too_close = false;
-                for (const auto& edge : all_boundary_edges) {
-                    double ex = edge.b.x - edge.a.x;
-                    double ey = edge.b.y - edge.a.y;
-                    double len = std::sqrt(ex*ex + ey*ey);
-                    if (len < 1e-10) continue;
-                    double t = ((x - edge.a.x)*ex + (y - edge.a.y)*ey) / (len*len);
-                    t = std::max(0.0, std::min(1.0, t));
-                    double cx = edge.a.x + t * ex;
-                    double cy = edge.a.y + t * ey;
-                    double dist = std::sqrt((x-cx)*(x-cx) + (y-cy)*(y-cy));
-                    if (dist < margin) { too_close = true; break; }
-                }
-                if (!too_close) {
-                    vertices.push_back({x, y});
-                }
-            }
-        }
-
-        // 6. Run CDT (Constrained Delaunay Triangulation)
-        CDT::Triangulation<double> cdt;
-
-        std::vector<CDT::V2d<double>> cdt_verts;
-        for (const auto& v : vertices) {
-            cdt_verts.push_back(CDT::V2d<double>::make(v.x, v.y));
-        }
-        cdt.insertVertices(cdt_verts);
-
-        // Constraint edges: outer boundary loop
-        std::vector<CDT::Edge> edges;
-        for (int i = 0; i < n_outer; ++i) {
-            edges.push_back(CDT::Edge(i, (i + 1) % n_outer));
-        }
-        // Constraint edges: each hole loop (per-loop wrapping)
         for (size_t h = 0; h < holes.size(); ++h) {
-            int offset = hole_offsets[h];
             int nh = (int)holes[h].size();
+            int offset = hole_offsets[h];
             for (int i = 0; i < nh; ++i) {
-                edges.push_back(CDT::Edge(offset + i, offset + (i + 1) % nh));
+                segmentlist.push_back(offset + i);
+                segmentlist.push_back(offset + (i + 1) % nh);
             }
         }
-        cdt.insertEdges(edges);
 
-        // Erase outer triangles AND hole triangles (depth peeling)
-        cdt.eraseOuterTrianglesAndHoles();
-
-        // 7. Extract triangulation result
-        // Count total boundary vertices for boundary_set
-        int total_boundary_verts = n_outer;
-        for (const auto& hole : holes) total_boundary_verts += (int)hole.size();
-
-        vertices.clear();
-        boundary_nodes.clear();
-
-        std::set<int> boundary_set;
-        for (int i = 0; i < total_boundary_verts; ++i) {
-            boundary_set.insert(i);
+        // Hole list: one point inside each hole (centroid)
+        std::vector<TRI_REAL> holelist;
+        for (const auto& hole : holes) {
+            if (hole.empty()) continue;
+            double hx = 0, hy = 0;
+            for (const auto& v : hole) { hx += v.x; hy += v.y; }
+            hx /= (double)hole.size();
+            hy /= (double)hole.size();
+            holelist.push_back((TRI_REAL)hx);
+            holelist.push_back((TRI_REAL)hy);
         }
 
-        for (size_t i = 0; i < cdt.vertices.size(); ++i) {
-            vertices.push_back({cdt.vertices[i].x, cdt.vertices[i].y});
-            if (boundary_set.count(i)) {
+        // One region: centroid of outer polygon + max area constraint
+        double cx = 0, cy = 0;
+        for (const auto& v : boundary_poly) { cx += v.x; cy += v.y; }
+        cx /= (double)n_outer;
+        cy /= (double)n_outer;
+        std::vector<TRI_REAL> regionlist;
+        regionlist.push_back((TRI_REAL)cx);
+        regionlist.push_back((TRI_REAL)cy);
+        regionlist.push_back(0);
+        regionlist.push_back((TRI_REAL)max_area);
+
+        struct triangulateio in, out;
+        memset(&in, 0, sizeof(in));
+        memset(&out, 0, sizeof(out));
+
+        in.numberofpoints = (int)(pointlist.size() / 2);
+        in.pointlist = pointlist.data();
+        in.pointmarkerlist = pointmarkerlist.data();
+        in.numberofpointattributes = 0;
+
+        in.numberofsegments = (int)(segmentlist.size() / 2);
+        in.segmentlist = segmentlist.data();
+        in.segmentmarkerlist = nullptr;
+
+        in.numberofholes = (int)(holelist.size() / 2);
+        in.holelist = holelist.empty() ? nullptr : holelist.data();
+
+        in.numberofregions = 1;
+        in.regionlist = regionlist.data();
+
+        // p=PSLG, z=zero-based, q20=min angle 20°, a=area constraint from regionlist, Q=quiet
+        triangulate(const_cast<char*>("pzq20aQ"), &in, &out, nullptr);
+
+        // Copy output to Mesh
+        vertices.reserve(out.numberofpoints);
+        for (int i = 0; i < out.numberofpoints; ++i) {
+            vertices.push_back({out.pointlist[2 * i], out.pointlist[2 * i + 1]});
+        }
+        for (int i = 0; i < out.numberofpoints; ++i) {
+            if (out.pointmarkerlist[i] != 0) {
                 boundary_nodes.push_back(i);
             }
         }
-
-        for (const auto& tri : cdt.triangles) {
-            elements.push_back({(int)tri.vertices[0], (int)tri.vertices[1], (int)tri.vertices[2]});
+        elements.reserve(out.numberoftriangles);
+        for (int i = 0; i < out.numberoftriangles; ++i) {
+            elements.push_back({
+                out.trianglelist[3 * i],
+                out.trianglelist[3 * i + 1],
+                out.trianglelist[3 * i + 2]
+            });
         }
 
-        std::cout << "Custom mesh: " << vertices.size() << " vertices, " 
+        // Free Triangle-allocated output (trifree takes int* in the API)
+        trifree(reinterpret_cast<int*>(out.pointlist));
+        trifree(out.pointmarkerlist);
+        trifree(out.trianglelist);
+
+        std::cout << "Triangle mesh: " << vertices.size() << " vertices, "
                   << elements.size() << " triangles, "
                   << boundary_nodes.size() << " boundary nodes" << std::endl;
     }
@@ -244,7 +199,7 @@ public:
 
     // ─── Generate Annulus Mesh (ring with hole) ─────────────────────────────
     void generate_annulus(double outer_r, double inner_r, int density = 15) {
-        // Enforce a strict minimum gap to prevent CDT from crashing due to overlapping boundaries
+        // Enforce a strict minimum gap to prevent Triangle from failing on overlapping boundaries
         double min_gap = 3.0 / (double)density;
         if (inner_r >= outer_r - min_gap) {
             inner_r = std::max(0.01, outer_r - min_gap);

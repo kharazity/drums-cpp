@@ -67,13 +67,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(implot)
 
-# 6. CDT (Constrained Delaunay Triangulation - header-only)
+# 6. Triangle (Shewchuk — quality 2D mesh generator with refinement)
 FetchContent_Declare(
-  CDT
-  GIT_REPOSITORY https://github.com/artem-ogre/CDT.git
-  GIT_TAG        1.4.1
+  triangle
+  GIT_REPOSITORY https://github.com/libigl/triangle.git
+  GIT_TAG        master
 )
-FetchContent_MakeAvailable(CDT)
+set(BUILD_EXECUTABLE OFF CACHE BOOL "" FORCE)
+set(BUILD_LIBRARY ON CACHE BOOL "" FORCE)
+FetchContent_Populate(triangle)
+add_subdirectory(${triangle_SOURCE_DIR} ${triangle_BINARY_DIR})
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 
@@ -112,10 +115,11 @@ target_link_libraries(drums_cpp PRIVATE
     SDL2::SDL2main
     imgui_lib
     implot_lib
+    triangle
 )
 
 # Spectra is header-only but needs to be in include path
-target_include_directories(drums_cpp PRIVATE ${spectra_SOURCE_DIR}/include ${cdt_SOURCE_DIR}/CDT/include)
+target_include_directories(drums_cpp PRIVATE ${spectra_SOURCE_DIR}/include ${triangle_SOURCE_DIR})
 
 # Test Executable
 add_executable(test_polygon
@@ -124,6 +128,7 @@ add_executable(test_polygon
 
 target_link_libraries(test_polygon PRIVATE
     Eigen3::Eigen
+    triangle
 )
 
-target_include_directories(test_polygon PRIVATE ${spectra_SOURCE_DIR}/include ${cdt_SOURCE_DIR}/CDT/include)
+target_include_directories(test_polygon PRIVATE ${spectra_SOURCE_DIR}/include ${triangle_SOURCE_DIR})

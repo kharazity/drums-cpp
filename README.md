@@ -39,7 +39,7 @@ sudo apt-get install -y cmake g++ libeigen3-dev libgl-dev libsdl2-dev
 ```
 *(If you encounter "Failed to init audio", ensure you didn't accidentally build SDL2 from source without audio backend headers. Clear your `build/` dir after installing system dependencies).*
 
-All other dependencies (ImGui, ImPlot, Spectra, CDT) are fetched automatically by CMake.
+All other dependencies (ImGui, ImPlot, Spectra, Triangle) are fetched automatically by CMake.
 
 ## Build & Run
 
@@ -62,7 +62,7 @@ cmake --build . -j$(nproc)
 
 ## Architecture
 
-- **`geometry.h`** — Mesh generation (polygons, ellipses, isospectral drums, custom shapes with holes via CDT)
+- **`geometry.h`** — Mesh generation (polygons, ellipses, isospectral drums, custom shapes with holes via Triangle with quality refinement)
 - **`fem.h`** — FEM stiffness (K) and mass (M) matrix assembly
 - **`solver.h`** — Eigenvalue solver using Spectra (shift-invert mode)
 - **`audio.h`** — Real-time audio engine with strict concurrency control and realistic decay physics

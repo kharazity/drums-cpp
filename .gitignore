@@ -1,5 +1,7 @@
 # Build artifacts
 build/
+build2/
+build*/
 *.o
 *.a
 *.so
@@ -7,7 +9,15 @@ build/
 *.dll
 todo.md
 drums_cpp
+test_polygon
 output/
+
+# CMake (in-tree and in build dirs)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+_deps/
 
 # IDE / Editor
 .cache/
